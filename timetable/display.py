@@ -23,7 +23,7 @@ def calc_duration(start, end):
 
 def render_day(data, day):
     """Renders schedule for a single day."""
-    slots = data.get("monday", [])
+    slots = data.get(day, [])
 
     day_name = day.capitalize()
     print(f"\n📅 Timetable for {day_name}:")

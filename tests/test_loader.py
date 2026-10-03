@@ -1,8 +1,11 @@
 """Unit tests for timetable loading and duration calculation."""
 
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+
 from timetable.loader import load_timetable
-from timetable.display import calc_duration
+from timetable.display import WEEKDAYS, calc_duration, render_day
 
 
 class TestTimetableLoader(unittest.TestCase):
@@ -12,6 +15,19 @@ class TestTimetableLoader(unittest.TestCase):
         data = load_timetable()
         self.assertIsInstance(data, dict)
         self.assertIn("monday", data)
+
+    def test_render_each_timetable_day(self):
+        """Each weekday key should render its own heading and schedule."""
+        data = load_timetable()
+
+        for day in WEEKDAYS:
+            with self.subTest(day=day):
+                output = StringIO()
+                with redirect_stdout(output):
+                    render_day(data, day)
+
+                heading = output.getvalue().splitlines()[1]
+                self.assertEqual(heading, f"📅 Timetable for {day.capitalize()}:")
 
     def test_load_nonexistent_file(self):
         """Loading a non-existent file should return a default weekday structure."""
