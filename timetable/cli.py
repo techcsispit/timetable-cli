@@ -10,6 +10,7 @@ from timetable.filter import filter_timetable, render_filter
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
+from timetable.conflicts import find_conflicts, render_conflicts
 
 
 def cmd_show(args):
@@ -81,6 +82,26 @@ def cmd_diff(args):
     sys.exit(1 if result.has_changes else 0)
 
 
+def cmd_conflicts(args):
+    """Detects overlapping classes in the timetable file."""
+    filepath = args.file if args.file is not None else DEFAULT_FILEPATH
+    target = Path(filepath)
+
+    if not target.exists():
+        print(f"Error: Timetable file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = load_timetable(target)
+    except Exception as exc:
+        print(f"Error reading {filepath}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    conflicts = find_conflicts(data)
+    render_conflicts(conflicts)
+    sys.exit(1 if conflicts else 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Timetable CLI - Manage and view your weekly schedule")
     parser.add_argument("--file", default=DEFAULT_FILEPATH, help="Path to timetable.json")
@@ -129,6 +150,19 @@ def main():
     p_diff.add_argument("first", help="Path to the first timetable JSON file")
     p_diff.add_argument("second", help="Path to the second timetable JSON file")
     p_diff.set_defaults(func=cmd_diff)
+
+    # conflicts
+    p_conflicts = subparsers.add_parser(
+        "conflicts",
+        help="Detect overlapping class schedules on the same day",
+    )
+    p_conflicts.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Path to timetable JSON file (defaults to timetable.json)",
+    )
+    p_conflicts.set_defaults(func=cmd_conflicts)
 
     args = parser.parse_args()
     if not args.command:
