@@ -22,11 +22,16 @@ def parse_time(value):
 
 
 def calc_duration(start, end):
-    """Calculates duration in minutes between start and end time (HH:MM)."""
+    """Calculates duration in minutes between start and end time (HH:MM).
+
+    A class whose end is earlier on the clock than its start (for example
+    23:00 to 01:00) runs past midnight, so its end falls on the next day.
+    """
     try:
         sh, sm = map(int, start.split(":"))
         eh, em = map(int, end.split(":"))
-        return (eh * 60 + em) - (sh * 60 + sm)
+        minutes = (eh * 60 + em) - (sh * 60 + sm)
+        return minutes + 24 * 60 if minutes < 0 else minutes
     except Exception:
         return 0
 

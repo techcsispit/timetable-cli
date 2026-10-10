@@ -61,6 +61,10 @@ def check_clash(slots, start_min, end_min):
             eh, em = map(int, slot["end"].split(":"))
             slot_start = sh * 60 + sm
             slot_end = eh * 60 + em
+            if slot_end < slot_start:
+                # A stored class that runs past midnight (e.g. 23:00-01:00)
+                # occupies the rest of this day.
+                slot_end += 24 * 60
             if max(start_min, slot_start) < min(end_min, slot_end):
                 return slot
         except Exception:
