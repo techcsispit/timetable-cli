@@ -28,6 +28,7 @@ On Windows, use `python` instead of `python3`.
 | `export [--output FILE]` | Writes a `timetable.ics` calendar file |
 | `filter [--day --start --end --room]` | Classes matching a day, time range and/or room |
 | `add --day --subject --start --end --room` | Adds a class |
+| `conflicts [FILE]` | Lists classes that overlap on the same day in `FILE` (default `timetable.json`); exits with status `1` if any overlap or the file can't be read |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
 
 ## How it's supposed to work
@@ -97,6 +98,7 @@ When the timetables are identical it prints `No changes detected. The timetables
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file
 - `timetable/filter.py`: reusable filtering by day, time range and room
+- `timetable/conflicts.py`: finding classes that overlap on the same day
 - `timetable/diff.py`: comparing two timetable files
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
