@@ -29,6 +29,7 @@ On Windows, use `python` instead of `python3`.
 | `filter [--day --start --end --room]` | Classes matching a day, time range and/or room |
 | `add --day --subject --start --end --room` | Adds a class |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
+| `merge <first> <second> [--output OUT] [--force]` | Combines two timetables into one with conflict detection |
 
 ## How it's supposed to work
 
@@ -90,6 +91,19 @@ Modified:
 
 When the timetables are identical it prints `No changes detected. The timetables are identical.` The command exits with status `0` when the files match and non-zero when they differ or an input is missing/invalid, so it can be used in scripts. Neither input file is modified.
 
+## Merging two timetables
+
+```bash
+python3 -m timetable merge timetable.json timetable-new.json --output merged.json
+```
+
+`merge` combines two timetable JSON files into a single merged timetable file without modifying either input file.
+
+- **Duplicate handling**: Identical classes (same subject, start time, end time, and room on the same day) are deduplicated so only one instance is kept in the output.
+- **Conflict detection**: Classes occurring on the same day that overlap in time (evaluated using half-open intervals `[start, end)`) are detected as conflicts. If conflicts exist, the operation halts with exit code `1`, prints all conflicting pairs clearly to stderr, and avoids producing a merged file.
+- **Deterministic ordering**: The output merged timetable is deterministically sorted by canonical weekday order (Monday to Sunday) and start time.
+- **Output file safety**: The output path cannot match either input path. If the output file already exists, `merge` will refuse to overwrite it unless `--force` is provided.
+
 ## Code
 
 - `timetable/loader.py`: reading and writing `timetable.json`
@@ -98,8 +112,10 @@ When the timetables are identical it prints `No changes detected. The timetables
 - `timetable/export.py`: writing the `.ics` calendar file
 - `timetable/filter.py`: reusable filtering by day, time range and room
 - `timetable/diff.py`: comparing two timetable files
+- `timetable/merge.py`: combining timetables with deduplication and conflict detection
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
+
 
 ## Contributing
 

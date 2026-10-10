@@ -12,7 +12,12 @@ from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 from timetable.conflicts import find_conflicts, render_conflicts
 from timetable.stats import compute_stats, render_stats
-
+from timetable.merge import (
+    MergeError,
+    load_timetable_for_merge,
+    merge_timetables,
+    render_merge_conflicts,
+)
 
 def validate_day(day_str):
     """Validates that day_str is a recognized weekday, ignoring case.
@@ -199,6 +204,53 @@ def cmd_stats(args):
 
     render_stats(stats)
 
+def cmd_merge(args):
+    """Merges two timetable JSON files with conflict detection."""
+    try:
+        first_path = Path(args.first).resolve()
+        second_path = Path(args.second).resolve()
+    except Exception as exc:
+        print(f"Error resolving paths: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    output_path = Path(args.output).resolve() if args.output else None
+
+    if output_path:
+        if output_path == first_path or output_path == second_path:
+            print(
+                f"Error: Output file '{args.output}' cannot be the same as input file '{args.first if output_path == first_path else args.second}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if output_path.exists() and not args.force:
+            print(
+                f"Error: Output file '{args.output}' already exists. Use --force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    try:
+        first_data = load_timetable_for_merge(args.first)
+        second_data = load_timetable_for_merge(args.second)
+    except MergeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    merged_data, conflicts = merge_timetables(first_data, second_data)
+
+    if conflicts:
+        print(render_merge_conflicts(conflicts), file=sys.stderr)
+        print("Error: Could not merge timetables due to scheduling conflicts.", file=sys.stderr)
+        sys.exit(1)
+
+    if output_path:
+        save_timetable(merged_data, output_path)
+        print(f"Successfully merged timetables into '{args.output}'.")
+    else:
+        print("Successfully merged timetables (dry run, no --output specified).")
+
+    sys.exit(0)
+
 
 def main():
     if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -281,6 +333,17 @@ def main():
         help="Path to timetable JSON file (defaults to timetable.json)",
     )
     p_stats.set_defaults(func=cmd_stats)
+
+    # merge
+    p_merge = subparsers.add_parser(
+        "merge",
+        help="Merge two timetable JSON files with conflict detection",
+    )
+    p_merge.add_argument("first", help="Path to first timetable JSON file")
+    p_merge.add_argument("second", help="Path to second timetable JSON file")
+    p_merge.add_argument("--output", help="Path to output merged timetable JSON file")
+    p_merge.add_argument("--force", action="store_true", help="Overwrite output file if it already exists")
+    p_merge.set_defaults(func=cmd_merge)
 
     args = parser.parse_args()
     if not args.command:
