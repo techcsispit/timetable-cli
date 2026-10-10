@@ -49,6 +49,16 @@ class TestValidationAndOrdering(unittest.TestCase):
                         parse_time(invalid)
                 self.assertIn("Error", err_out.getvalue())
 
+    def test_parse_time_rejects_signs_spaces_and_non_ascii_digits(self):
+        """Strings int() tolerates but that are not two digits, colon, two digits are refused."""
+        for invalid in ["+6:00", " 8:30", "11:+5", "-1:00", "08: 5", "09:5 ", "٠٩:00"]:
+            with self.subTest(invalid=invalid):
+                err_out = StringIO()
+                with redirect_stderr(err_out):
+                    with self.assertRaises(SystemExit):
+                        parse_time(invalid)
+                self.assertIn("Error", err_out.getvalue())
+
     def test_parse_time_nonexistent_hours_and_minutes(self):
         """Non-existent times (e.g. 25:99, 24:00, 12:60) should exit with an error."""
         for invalid in ["24:00", "25:99", "12:60", "99:00"]:
@@ -132,6 +142,26 @@ class TestValidationAndOrdering(unittest.TestCase):
         self.assertEqual(len(data["monday"]), 2)
         self.assertEqual(data["monday"][0]["subject"], "Morning Class")
         self.assertEqual(data["monday"][1]["subject"], "Afternoon Class")
+
+    def test_cmd_add_refuses_malformed_time_and_saves_nothing(self):
+        """Times like +6:00 or ' 8:30' must be refused and must not reach the file."""
+        cases = [("+6:00", "07:00"), (" 8:30", "09:00"), ("10:00", "11:+5")]
+        for start, end in cases:
+            with self.subTest(start=start, end=end):
+                with tempfile.TemporaryDirectory() as tmp:
+                    temp_path = Path(tmp) / "timetable.json"
+                    save_timetable({"sunday": []}, temp_path)
+
+                    args = SimpleNamespace(
+                        file=temp_path, day="sunday", subject="Probe",
+                        start=start, end=end, room="R1"
+                    )
+                    err_out = StringIO()
+                    with redirect_stderr(err_out):
+                        with self.assertRaises(SystemExit):
+                            cmd_add(args)
+                    self.assertIn("Error", err_out.getvalue())
+                    self.assertEqual(load_timetable(temp_path)["sunday"], [])
 
     def test_render_day_case_insensitive(self):
         """render_day should render the same schedule regardless of day parameter casing."""
