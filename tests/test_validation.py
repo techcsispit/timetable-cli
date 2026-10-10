@@ -90,6 +90,36 @@ class TestValidationAndOrdering(unittest.TestCase):
         clash = check_clash(existing_slots, parse_time("08:00"), parse_time("09:00"))
         self.assertIsNone(clash)
 
+    def test_check_clash_detects_overnight_slot(self):
+        """A stored class that runs past midnight should clash with an overlapping add."""
+        existing_slots = [
+            {"subject": "Hackathon Lab Prep", "start": "23:00", "end": "01:00", "room": "IC"}
+        ]
+        # Overlaps the late class
+        clash = check_clash(existing_slots, parse_time("22:00"), parse_time("23:30"))
+        self.assertIsNotNone(clash)
+        self.assertEqual(clash["subject"], "Hackathon Lab Prep")
+
+        # Ends exactly when the late class starts: no clash
+        clash = check_clash(existing_slots, parse_time("21:00"), parse_time("23:00"))
+        self.assertIsNone(clash)
+
+    def test_cmd_add_refuses_clash_with_shipped_overnight_class(self):
+        """On the shipped timetable.json, a Friday 22:00-23:30 class clashes with 23:00-01:00."""
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_path = Path(tmp) / "timetable.json"
+            save_timetable(load_timetable(), temp_path)
+
+            args = SimpleNamespace(
+                file=temp_path, day="friday", subject="Clash",
+                start="22:00", end="23:30", room="R9"
+            )
+            err_out = StringIO()
+            with redirect_stderr(err_out):
+                with self.assertRaises(SystemExit):
+                    cmd_add(args)
+            self.assertIn("Hackathon Lab Prep", err_out.getvalue())
+
     def test_cmd_add_rejects_end_before_start(self):
         """Adding a class where end <= start must exit with error."""
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
