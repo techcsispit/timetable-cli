@@ -110,8 +110,9 @@ def render_filter(results, day=None, start=None, end=None, room=None):
     """Prints the filtered timetable in the existing display style.
 
     The output mirrors ``render_day``: a heading, a column header, and one
-    row per class showing time, duration, subject and room. When nothing
-    matches, a friendly message is printed instead of an error.
+    row per class showing time, duration, subject and room, listed in order
+    of start time within each day. When nothing matches, a friendly message
+    is printed instead of an error.
     """
     parts = []
     if day is not None:
@@ -133,7 +134,8 @@ def render_filter(results, day=None, start=None, end=None, room=None):
     print(f"{'Time':<15} {'Duration':<12} {'Subject':<22} {'Room':<12}")
     print("-" * 65)
     for current_day in WEEKDAYS:
-        for slot in results.get(current_day, []):
+        slots = sorted(results.get(current_day, []), key=lambda s: s.get("start", ""))
+        for slot in slots:
             dur = calc_duration(slot.get("start", "00:00"), slot.get("end", "00:00"))
             time_str = f"{slot.get('start')} - {slot.get('end')}"
             dur_str = f"{dur} min"
