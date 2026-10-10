@@ -202,5 +202,36 @@ class TestRenderFilter(unittest.TestCase):
         self.assertIn("No classes match the given filters.", text)
 
 
+    def test_classes_listed_in_start_time_order(self):
+        """Rows should be in start-time order however they are stored."""
+        unsorted = {
+            "tuesday": [
+                {"subject": "Databases", "start": "11:00", "end": "12:30", "room": "Lab 1"},
+                {"subject": "Operating Systems", "start": "08:30", "end": "10:00", "room": "Room 302"},
+                {"subject": "Software Engineering", "start": "13:30", "end": "15:00", "room": "Room 105"},
+            ],
+        }
+        results = filter_timetable(unsorted, day="tuesday")
+        text = self.render(results, day="tuesday")
+        self.assertLess(text.index("Operating Systems"), text.index("Databases"))
+        self.assertLess(text.index("Databases"), text.index("Software Engineering"))
+
+    def test_start_time_order_applies_to_each_day(self):
+        """With no day given, each weekday's rows are still ordered by start time."""
+        unsorted = {
+            "monday": [
+                {"subject": "Late", "start": "14:00", "end": "15:00", "room": "A"},
+                {"subject": "Early", "start": "09:00", "end": "10:00", "room": "A"},
+            ],
+            "tuesday": [
+                {"subject": "TueLate", "start": "13:00", "end": "14:00", "room": "A"},
+                {"subject": "TueEarly", "start": "08:00", "end": "09:00", "room": "A"},
+            ],
+        }
+        text = self.render(filter_timetable(unsorted, room="A"), room="A")
+        order = [text.index(name) for name in ("Early", "Late", "TueEarly", "TueLate")]
+        self.assertEqual(order, sorted(order))
+
+
 if __name__ == "__main__":
     unittest.main()
