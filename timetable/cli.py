@@ -36,12 +36,13 @@ def parse_time(time_str):
     if len(parts) != 2 or len(parts[0]) != 2 or len(parts[1]) != 2:
         print(f"Error: Invalid time format '{time_str}'. Time must be 24-hour HH:MM.", file=sys.stderr)
         sys.exit(1)
-    try:
-        hours = int(parts[0])
-        minutes = int(parts[1])
-    except ValueError:
+    # int() also accepts signs, spaces and non-ASCII digits ("+6", " 8"), so
+    # require plain 0-9 digits before converting.
+    if not all(part.isascii() and part.isdigit() for part in parts):
         print(f"Error: Non-numeric time value in '{time_str}'.", file=sys.stderr)
         sys.exit(1)
+    hours = int(parts[0])
+    minutes = int(parts[1])
 
     if not (0 <= hours <= 23 and 0 <= minutes <= 59):
         print(f"Error: Time '{time_str}' does not exist. Hours must be 00-23 and minutes 00-59.", file=sys.stderr)
