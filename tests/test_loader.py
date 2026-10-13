@@ -1,11 +1,12 @@
 """Unit tests for timetable loading and duration calculation."""
 
+import re
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 
 from timetable.loader import load_timetable
-from timetable.display import WEEKDAYS, calc_duration, render_day
+from timetable.display import WEEKDAYS, calc_duration, render_day, render_week
 
 
 class TestTimetableLoader(unittest.TestCase):
@@ -39,6 +40,23 @@ class TestTimetableLoader(unittest.TestCase):
         """Normal daytime slot duration should be calculated in minutes."""
         # 09:00 to 10:30 is 90 minutes
         self.assertEqual(calc_duration("09:00", "10:30"), 90)
+
+    def test_calc_duration_overnight(self):
+        """A class that runs past midnight should have a positive duration."""
+        # 23:00 to 01:00 the next day is 120 minutes
+        self.assertEqual(calc_duration("23:00", "01:00"), 120)
+
+    def test_shipped_timetable_never_shows_negative_duration(self):
+        """Every class in the shipped timetable.json shows a positive duration."""
+        data = load_timetable()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            render_day(data, "friday")
+            render_week(data)
+
+        self.assertIsNone(re.search(r"-\d+ min", output.getvalue()))
+        self.assertIn("120 min", output.getvalue())
 
 
 if __name__ == "__main__":
