@@ -71,6 +71,10 @@ class WriteFailureError(HistoryError):
     """Raised when a file write fails and the timetable cannot be updated safely."""
 
 
+class SnapshotMismatchError(HistoryError):
+    """Raised when a snapshot belongs to a different timetable file."""
+
+
 def history_directory(timetable_file: Optional[Path] = None) -> Path:
     """Return the directory where snapshots for *timetable_file* are stored.
 
@@ -82,6 +86,33 @@ def history_directory(timetable_file: Optional[Path] = None) -> Path:
         timetable_file = DEFAULT_FILEPATH
     base = Path(timetable_file).resolve().parent
     return base / ".timetable-history"
+
+
+def _same_timetable(recorded: Any, timetable_file: Path) -> bool:
+    """Return True when the *recorded* snapshot path names *timetable_file*.
+
+    Several timetables in one folder share the same history directory, so the
+    timetable path stored in each snapshot's metadata is what ties a snapshot
+    to the file it was taken from.
+    """
+    try:
+        recorded_path = os.path.normcase(str(Path(recorded).resolve()))
+        active_path = os.path.normcase(str(Path(timetable_file).resolve()))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return recorded_path == active_path
+
+
+def _require_same_timetable(
+    metadata: Dict[str, Any], snapshot_id: str, timetable_file: Path
+) -> None:
+    """Raise when *snapshot_id* was created for a different timetable."""
+    recorded = metadata.get("timetable")
+    if not _same_timetable(recorded, timetable_file):
+        raise SnapshotMismatchError(
+            "Snapshot '%s' belongs to '%s', not '%s'."
+            % (snapshot_id, recorded, timetable_file)
+        )
 
 
 def default_retention_limit() -> int:
@@ -325,12 +356,18 @@ def _verify_snapshot(snapshot_dir: Path, metadata: Dict[str, Any]) -> bool:
     return _checksum(data) == metadata.get("checksum")
 
 
-def list_snapshots(history_dir: Path, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def list_snapshots(
+    history_dir: Path,
+    *,
+    limit: Optional[int] = None,
+    timetable: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     """Return snapshot metadata in reverse chronological order.
 
     Each entry is a dict with ``id``, ``created_at`` and ``operation``.  The
     list is deterministic and truncated to *limit* when a positive value is
-    given.
+    given.  When *timetable* is given, only snapshots taken from that
+    timetable file are returned.
     """
     if limit is not None:
         limit = validate_retention_limit(limit)
@@ -353,6 +390,8 @@ def list_snapshots(history_dir: Path, *, limit: Optional[int] = None) -> List[Di
             continue
         if not _verify_snapshot(path, metadata):
             continue
+        if timetable is not None and not _same_timetable(metadata.get("timetable"), timetable):
+            continue
         snapshots.append(
             {
                 "id": metadata.get("id"),
@@ -366,7 +405,12 @@ def list_snapshots(history_dir: Path, *, limit: Optional[int] = None) -> List[Di
     return snapshots
 
 
-def show_snapshot(snapshot_id: str, history_dir: Path) -> Dict[str, Any]:
+def show_snapshot(
+    snapshot_id: str,
+    history_dir: Path,
+    *,
+    timetable: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Load and render a snapshot without changing the active timetable.
 
     Raises :class:`SnapshotNotFoundError` / :class:`SnapshotCorruptError` for
@@ -374,6 +418,8 @@ def show_snapshot(snapshot_id: str, history_dir: Path) -> Dict[str, Any]:
     modified.
     """
     document = load_snapshot(snapshot_id, history_dir)
+    if timetable is not None:
+        _require_same_timetable(document["metadata"], snapshot_id, timetable)
     render_timetable(document["timetable"])
     return document
 
@@ -401,7 +447,7 @@ def save_snapshot(
         "id": snapshot_id,
         "created_at": _utc_now(),
         "operation": operation,
-        "timetable": str(timetable_file),
+        "timetable": str(timetable_file.resolve()),
         "checksum": None,
     }
 
@@ -460,6 +506,10 @@ def restore_snapshot(
         raise
     except SnapshotCorruptError as exc:
         raise SnapshotCorruptError("Cannot restore '%s': %s" % (snapshot_id, exc)) from exc
+
+    # A snapshot may only replace the timetable it was taken from; timetables
+    # in the same folder share one history directory.
+    _require_same_timetable(document["metadata"], snapshot_id, timetable_file)
 
     restored_timetable = document["timetable"]
 
@@ -525,12 +575,19 @@ def _active_restore_targets(history_dir: Path) -> set:
     return targets
 
 
-def prune_snapshots(history_dir: Path, limit: int) -> int:
+def prune_snapshots(
+    history_dir: Path,
+    limit: int,
+    *,
+    timetable: Optional[Path] = None,
+) -> int:
     """Retain the *limit* newest snapshots, deleting the older ones.
 
     Returns the number of snapshots removed.  Removals happen only after the
     snapshot was saved and verified successfully, and no snapshot currently
-    needed for an in-progress restore is deleted.
+    needed for an in-progress restore is deleted.  When *timetable* is given,
+    retention is applied only to snapshots owned by that timetable; snapshots
+    for other files sharing the directory are left untouched.
     """
     limit = validate_retention_limit(limit)
     if not history_dir.exists():
@@ -539,6 +596,20 @@ def prune_snapshots(history_dir: Path, limit: int) -> int:
     snapshots = sorted(
         (p for p in history_dir.iterdir() if p.is_dir()), key=lambda p: p.name
     )
+
+    if timetable is not None:
+        owned_snapshots = []
+        for path in snapshots:
+            meta_path = _metadata_path(path)
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(metadata, dict) and _same_timetable(
+                metadata.get("timetable"), timetable
+            ):
+                owned_snapshots.append(path)
+        snapshots = owned_snapshots
 
     # Never delete a snapshot that is currently the active restore target.
     active_ids = _active_restore_targets(history_dir)

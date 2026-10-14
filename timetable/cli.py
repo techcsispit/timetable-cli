@@ -22,6 +22,7 @@ from timetable.history import (
     ENV_HISTORY_LIMIT,
     HistoryError,
     SnapshotCorruptError,
+    SnapshotMismatchError,
     SnapshotNotFoundError,
     WriteFailureError,
     default_retention_limit,
@@ -157,7 +158,11 @@ def _save_snapshot_before_file_write(
         operation=operation,
         history_dir=history_directory(filepath),
     )
-    prune_snapshots(history_directory(filepath), default_retention_limit())
+    prune_snapshots(
+        history_directory(filepath),
+        default_retention_limit(),
+        timetable=filepath,
+    )
     return snapshot_id
 
 
@@ -219,8 +224,16 @@ def cmd_history(args):
             print("Error: 'history show' requires a snapshot id.", file=sys.stderr)
             return 1
         try:
-            show_snapshot(args.snapshot_id, history_dir)
-        except (SnapshotNotFoundError, SnapshotCorruptError) as exc:
+            show_snapshot(
+                args.snapshot_id,
+                history_dir,
+                timetable=Path(args.file),
+            )
+        except (
+            SnapshotNotFoundError,
+            SnapshotCorruptError,
+            SnapshotMismatchError,
+        ) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         return 0
@@ -241,7 +254,7 @@ def cmd_history(args):
     else:
         limit = default_retention_limit()
 
-    snapshots = list_snapshots(history_dir, limit=limit)
+    snapshots = list_snapshots(history_dir, limit=limit, timetable=Path(args.file))
     if not snapshots:
         print("No snapshots found.")
         return 0
@@ -266,11 +279,20 @@ def cmd_restore(args):
             filepath=Path(args.file),
             history_dir=history_dir,
         )
-    except (SnapshotNotFoundError, SnapshotCorruptError, WriteFailureError) as exc:
+    except (
+        SnapshotNotFoundError,
+        SnapshotCorruptError,
+        SnapshotMismatchError,
+        WriteFailureError,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    prune_snapshots(history_dir, default_retention_limit())
+    prune_snapshots(
+        history_dir,
+        default_retention_limit(),
+        timetable=Path(args.file),
+    )
     print(f"Restored snapshot '{result['id']}' into '{args.file}'.")
     return 0
 

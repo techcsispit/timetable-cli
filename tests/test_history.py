@@ -21,6 +21,7 @@ from timetable.history import (
     METADATA_FILE,
     HistoryError,
     SnapshotCorruptError,
+    SnapshotMismatchError,
     SnapshotNotFoundError,
     WriteFailureError,
     _checksum,
@@ -558,3 +559,125 @@ class TestCliHistoryCommands(unittest.TestCase):
             self.assertEqual(list_snapshots(history_directory(tt)), [])
             active = json.loads(tt.read_text(encoding='utf-8'))
             self.assertEqual(active, BASE)
+
+    def test_history_is_scoped_to_selected_timetable(self):
+        """Timetables in one folder must not list or restore each other's snapshots."""
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            b = write_timetable(base / 'b.json', B_CURRENT)
+            snap_a = save_snapshot(
+                A_OLD, filepath=a, operation='edit', history_dir=history_directory(a)
+            )
+
+            code, out, _ = self.run_cli('--file', str(b), 'history', 'list')
+            self.assertEqual(code, 0)
+            self.assertNotIn(snap_a, out)
+
+            code, out, _ = self.run_cli('--file', str(a), 'history', 'list')
+            self.assertEqual(code, 0)
+            self.assertIn(snap_a, out)
+
+            code, out, err = self.run_cli(
+                '--file', str(b), 'history', 'show', snap_a
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(out, '')
+            self.assertIn('belongs to', err)
+
+            for argv in (('restore', snap_a), ('history', 'restore', snap_a)):
+                code, _, err = self.run_cli('--file', str(b), *argv)
+                self.assertEqual(code, 1)
+                self.assertIn('belongs to', err)
+                self.assertEqual(json.loads(b.read_text(encoding='utf-8')), B_CURRENT)
+
+
+A_OLD = {'monday': [{'subject': 'A-old', 'start': '09:00', 'end': '10:00', 'room': 'R1'}]}
+B_CURRENT = {'monday': [{'subject': 'B-current', 'start': '09:00', 'end': '10:00', 'room': 'R1'}]}
+
+
+class TestSnapshotOwnership(unittest.TestCase):
+    """Snapshots belong to the timetable file they were taken from."""
+
+    def test_list_filters_by_timetable(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            b = write_timetable(base / 'b.json', B_CURRENT)
+            hd = history_directory(a)
+            self.assertEqual(hd, history_directory(b))
+            snap_a = save_snapshot(A_OLD, filepath=a, operation='edit', history_dir=hd)
+            snap_b = save_snapshot(B_CURRENT, filepath=b, operation='edit', history_dir=hd)
+
+            self.assertEqual([s['id'] for s in list_snapshots(hd, timetable=a)], [snap_a])
+            self.assertEqual([s['id'] for s in list_snapshots(hd, timetable=b)], [snap_b])
+            self.assertEqual(len(list_snapshots(hd)), 2)
+
+    def test_restore_rejects_snapshot_from_other_timetable(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            b = write_timetable(base / 'b.json', B_CURRENT)
+            hd = history_directory(a)
+            snap_a = save_snapshot(A_OLD, filepath=a, operation='edit', history_dir=hd)
+
+            with self.assertRaises(SnapshotMismatchError):
+                restore_snapshot(snap_a, filepath=b, history_dir=hd)
+
+            # The other timetable is untouched and no snapshot was added for it.
+            self.assertEqual(json.loads(b.read_text(encoding='utf-8')), B_CURRENT)
+            self.assertEqual(list_snapshots(hd, timetable=b), [])
+            self.assertEqual(len(list_snapshots(hd)), 1)
+
+    def test_show_rejects_snapshot_from_other_timetable(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            b = write_timetable(base / 'b.json', B_CURRENT)
+            hd = history_directory(a)
+            snap_a = save_snapshot(A_OLD, filepath=a, operation='edit', history_dir=hd)
+
+            with self.assertRaises(SnapshotMismatchError):
+                show_snapshot(snap_a, hd, timetable=b)
+
+    def test_prune_only_removes_selected_timetables_snapshots(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            b = write_timetable(base / 'b.json', B_CURRENT)
+            hd = history_directory(a)
+            first_a = save_snapshot(A_OLD, filepath=a, operation='edit', history_dir=hd)
+            second_a = save_snapshot(B_CURRENT, filepath=a, operation='edit', history_dir=hd)
+            first_b = save_snapshot(B_CURRENT, filepath=b, operation='edit', history_dir=hd)
+            second_b = save_snapshot(A_OLD, filepath=b, operation='edit', history_dir=hd)
+
+            removed = prune_snapshots(hd, 1, timetable=a)
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(
+                [entry['id'] for entry in list_snapshots(hd, timetable=a)],
+                [second_a],
+            )
+            self.assertEqual(
+                [entry['id'] for entry in list_snapshots(hd, timetable=b)],
+                [second_b, first_b],
+            )
+            self.assertFalse((hd / first_a).exists())
+
+    def test_restore_matches_relative_and_absolute_paths(self):
+        with TemporaryDirectory() as td:
+            base = Path(td)
+            a = write_timetable(base / 'a.json', A_OLD)
+            hd = history_directory(a)
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                snap = save_snapshot(
+                    A_OLD, filepath=Path('a.json'), operation='edit', history_dir=hd
+                )
+            finally:
+                os.chdir(old_cwd)
+            write_timetable(a, B_CURRENT)
+
+            restore_snapshot(snap, filepath=a, history_dir=hd)
+            self.assertEqual(json.loads(a.read_text(encoding='utf-8')), A_OLD)
