@@ -290,6 +290,64 @@ class TestIcsParsingAndExpansion(ImportIcsTestCase):
         self.assertEqual(plan.new_classes[0][2]["start"], "10:00")
         self.assertEqual(plan.new_classes[0][2]["end"], "11:00")
 
+    def test_weekly_new_york_event_converts_each_occurrence_after_dst(self):
+        ics_text = (
+            "BEGIN:VCALENDAR\n"
+            "VERSION:2.0\n"
+            "BEGIN:VEVENT\n"
+            "UID:new-york-dst@example.com\n"
+            "SUMMARY:New York Lecture\n"
+            "DTSTART;TZID=America/New_York:20261026T090000\n"
+            "DTEND;TZID=America/New_York:20261026T100000\n"
+            "RRULE:FREQ=WEEKLY;COUNT=2\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        events, issues = parse_ics_content(ics_text)
+        self.assertEqual(issues, [])
+
+        occurrences, issues = expand_vevent(
+            events[0],
+            datetime.date(2026, 10, 26),
+            datetime.date(2026, 11, 2),
+            zoneinfo.ZoneInfo("Asia/Kolkata"),
+        )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(
+            [(occ.slot["start"], occ.slot["end"]) for occ in occurrences],
+            [("18:30", "19:30"), ("19:30", "20:30")],
+        )
+
+    def test_weekly_london_event_converts_each_occurrence_after_dst(self):
+        ics_text = (
+            "BEGIN:VCALENDAR\n"
+            "VERSION:2.0\n"
+            "BEGIN:VEVENT\n"
+            "UID:london-dst@example.com\n"
+            "SUMMARY:London Lecture\n"
+            "DTSTART;TZID=Europe/London:20261019T100000\n"
+            "DTEND;TZID=Europe/London:20261019T110000\n"
+            "RRULE:FREQ=WEEKLY;COUNT=2\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        events, issues = parse_ics_content(ics_text)
+        self.assertEqual(issues, [])
+
+        occurrences, issues = expand_vevent(
+            events[0],
+            datetime.date(2026, 10, 19),
+            datetime.date(2026, 10, 26),
+            zoneinfo.ZoneInfo("Asia/Kolkata"),
+        )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(
+            [(occ.slot["start"], occ.slot["end"]) for occ in occurrences],
+            [("14:30", "15:30"), ("15:30", "16:30")],
+        )
+
     def test_8_event_crossing_midnight(self):
         # Overnight event: 23:00 to 01:00 next day
         ics_text = (

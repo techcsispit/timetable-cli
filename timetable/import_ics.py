@@ -233,6 +233,7 @@ def parse_ics_datetime(
     val: str,
     params: Dict[str, str],
     target_tz: Optional[datetime.tzinfo] = None,
+    convert_to_target: bool = True,
 ) -> Tuple[Optional[datetime.datetime], bool, Optional[str]]:
     """Parses a date or datetime string from an ICS property.
 
@@ -241,7 +242,11 @@ def parse_ics_datetime(
     - If ends with 'Z', treated as UTC.
     - If TZID param is specified, parsed with ZoneInfo(tzid) if available.
     - If floating (no Z, no TZID), interpreted in target_tz if provided, else floating/naive.
-    - Converted to target_tz if target_tz is not None and dt is timezone-aware.
+    - Converted to target_tz when requested and the parsed value is timezone-aware.
+
+    Recurrence expansion parses DTSTART with ``convert_to_target=False`` so
+    weekly calendar arithmetic remains anchored to its source timezone.  Each
+    generated occurrence is converted only after the recurrence is expanded.
     """
     clean_val = val.strip()
     val_type = params.get("VALUE", "").upper()
@@ -288,7 +293,7 @@ def parse_ics_datetime(
         if tz is not None:
             # If target_tz was supplied for floating or parsed from Z/TZID
             dt = datetime.datetime(y, mo, d, h, mi, s, tzinfo=tz)
-            if target_tz is not None and tz != target_tz:
+            if convert_to_target and target_tz is not None and tz != target_tz:
                 dt = dt.astimezone(target_tz)
         else:
             dt = datetime.datetime(y, mo, d, h, mi, s)
@@ -357,7 +362,9 @@ def expand_vevent(
         issues.append(ValidationIssue(line, f"event '{summary or uid}' is missing DTSTART"))
         return [], issues
 
-    start_dt, start_is_all_day, start_err = parse_ics_datetime(dtstart_raw[0], dtstart_raw[1], target_tz)
+    start_dt, start_is_all_day, start_err = parse_ics_datetime(
+        dtstart_raw[0], dtstart_raw[1], target_tz, convert_to_target=False
+    )
     if start_err:
         issues.append(ValidationIssue(line, f"event '{summary or uid}': {start_err}"))
         return [], issues
@@ -377,7 +384,9 @@ def expand_vevent(
     end_dt: Optional[datetime.datetime] = None
     if dtend_raw is not None:
         end_val, end_params = dtend_raw
-        parsed_end, end_is_all_day, end_err = parse_ics_datetime(end_val, end_params, target_tz)
+        parsed_end, end_is_all_day, end_err = parse_ics_datetime(
+            end_val, end_params, target_tz, convert_to_target=False
+        )
         if end_err:
             issues.append(ValidationIssue(line, f"event '{summary or uid}': {end_err}"))
             return [], issues
@@ -432,7 +441,9 @@ def expand_vevent(
         for part in ex_val.split(","):
             if not part.strip():
                 continue
-            ex_dt, _, ex_err = parse_ics_datetime(part.strip(), ex_params, target_tz)
+            ex_dt, _, ex_err = parse_ics_datetime(
+                part.strip(), ex_params, target_tz, convert_to_target=False
+            )
             if ex_err:
                 issues.append(ValidationIssue(line, f"event '{summary or uid}' invalid EXDATE: {ex_err}"))
                 return [], issues
@@ -444,7 +455,9 @@ def expand_vevent(
         for part in rd_val.split(","):
             if not part.strip():
                 continue
-            rd_dt, rd_all_day, rd_err = parse_ics_datetime(part.strip(), rd_params, target_tz)
+            rd_dt, rd_all_day, rd_err = parse_ics_datetime(
+                part.strip(), rd_params, target_tz, convert_to_target=False
+            )
             if rd_err:
                 issues.append(ValidationIssue(line, f"event '{summary or uid}' invalid RDATE: {rd_err}"))
                 return [], issues
@@ -456,11 +469,15 @@ def expand_vevent(
 
     # Recurrence expansion window bounds (inclusive)
     # We construct window_start and window_end covering the full days
+    window_tz = target_tz or start_dt.tzinfo
     window_start = datetime.datetime.combine(from_date, datetime.time.min)
     window_end = datetime.datetime.combine(to_date, datetime.time.max)
-    if start_dt.tzinfo is not None:
-        window_start = window_start.replace(tzinfo=start_dt.tzinfo)
-        window_end = window_end.replace(tzinfo=start_dt.tzinfo)
+    if window_tz is not None:
+        window_start = window_start.replace(tzinfo=window_tz)
+        window_end = window_end.replace(tzinfo=window_tz)
+        if start_dt.tzinfo is not None and window_tz != start_dt.tzinfo:
+            window_start = window_start.astimezone(start_dt.tzinfo)
+            window_end = window_end.astimezone(start_dt.tzinfo)
 
     occurrence_start_times: List[datetime.datetime] = []
 
@@ -532,13 +549,19 @@ def expand_vevent(
 
     for occ_start in valid_starts:
         occ_end = occ_start + event_duration
-        occ_date = occ_start.date()
+        display_start = occ_start
+        display_end = occ_end
+        if target_tz is not None and occ_start.tzinfo is not None:
+            display_start = occ_start.astimezone(target_tz)
+            display_end = occ_end.astimezone(target_tz)
+
+        occ_date = display_start.date()
         # Derive weekday name
         weekday_idx = occ_date.weekday()  # Monday is 0, Sunday is 6
         day_name = WEEKDAYS[weekday_idx]
 
-        start_str = occ_start.strftime("%H:%M")
-        end_str = occ_end.strftime("%H:%M")
+        start_str = display_start.strftime("%H:%M")
+        end_str = display_end.strftime("%H:%M")
 
         slot = {
             "subject": summary if summary else "Untitled Event",
@@ -553,8 +576,8 @@ def expand_vevent(
                 summary=summary,
                 room=location,
                 occurrence_date=occ_date,
-                start_dt=occ_start,
-                end_dt=occ_end,
+                start_dt=display_start,
+                end_dt=display_end,
                 day=day_name,
                 slot=slot,
                 source_line=line,
