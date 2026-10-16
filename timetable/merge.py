@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from timetable.display import WEEKDAYS, parse_time
 from timetable.conflicts import do_overlap, find_conflicts
+from timetable.loader import load_timetable
+from timetable.schema import SchemaError
 
 
 class MergeError(Exception):
@@ -59,17 +61,13 @@ def load_timetable_for_merge(path):
     if not file_path.exists():
         raise MergeError(f"File not found: '{file_path}'")
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        return load_timetable(file_path)
     except json.JSONDecodeError as exc:
-        raise MergeError(f"Invalid JSON in '{file_path}': {exc}")
+        raise MergeError(f"Invalid JSON in '{file_path}': {exc}") from exc
+    except SchemaError as exc:
+        raise MergeError(str(exc)) from exc
     except OSError as exc:
-        raise MergeError(f"Could not read '{file_path}': {exc}")
-
-    validate_timetable_structure(data, source_name=str(file_path))
-    if isinstance(data, dict) and "schema_version" in data and "timetable" in data:
-        return data["timetable"]
-    return data
+        raise MergeError(f"Could not read '{file_path}': {exc}") from exc
 
 
 def canonicalize_slot(slot):

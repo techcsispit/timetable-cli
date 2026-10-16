@@ -269,7 +269,7 @@ class TestMergeCLI(MergeTestCase):
 
         code, out, err = self.run_merge(str(p1), str(p2))
         self.assertEqual(code, 1)
-        self.assertIn("must be a list of class slots", err)
+        self.assertIn("Expected list of classes", err)
 
     def test_input_files_remain_unchanged(self):
         t1_content = json.dumps({"monday": [make_slot("Math", "09:00", "10:00", "R101")]}, indent=2)
@@ -294,7 +294,7 @@ class TestMergeCLI(MergeTestCase):
     def test_output_file_overwrite_prevention_and_force(self):
         p1 = self.write_json("t1.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
         p2 = self.write_json("t2.json", {"tuesday": [make_slot("Physics", "10:00", "11:00", "R102")]})
-        out_p = self.write_json("merged.json", {"existing": "data"})
+        out_p = self.write_json("merged.json", {"wednesday": []})
 
         # Without --force
         code, out, err = self.run_merge(str(p1), str(p2), "--output", str(out_p))

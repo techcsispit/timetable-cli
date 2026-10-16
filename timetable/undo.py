@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from timetable.loader import DEFAULT_FILEPATH, load_timetable
+from timetable.loader import DEFAULT_FILEPATH, load_timetable, save_timetable
 
 #: Journal schema version written by this module.
 JOURNAL_VERSION = 1
@@ -580,10 +580,26 @@ def commit_mutation(
         before = load_journal(filepath, limit=limit)
 
     # Exact previous bytes (when readable) so undo can restore them verbatim.
+    # The journal's parsed snapshot must describe those exact bytes, not the
+    # normalized weekday mapping returned by ``load_timetable``.  Versioned
+    # documents contain schema metadata that normalization intentionally
+    # removes, and pairing their raw bytes with the normalized mapping would
+    # make an otherwise valid journal entry fail its own consistency check.
     previous_raw = _read_current_raw(filepath)
+    if previous_raw is not None:
+        try:
+            previous_snapshot = json.loads(previous_raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HistoryFileError(
+                "Current timetable %s is not valid UTF-8 JSON: %s"
+                % (filepath, exc)
+            ) from exc
+        _validate_snapshot(previous_snapshot, "current timetable document")
+    else:
+        previous_snapshot = previous
 
     document = before if before is not None else _empty_journal(timetable_path, limit)
-    entry = _make_entry(operation, previous, timetable_path, previous_raw)
+    entry = _make_entry(operation, previous_snapshot, timetable_path, previous_raw)
     document["undo"].append(entry)
     document["redo"] = []
     _prune(document, limit)
@@ -618,29 +634,8 @@ def commit_mutation(
 
 
 def _atomic_replace_timetable(filepath: Path, data: Dict[str, Any]) -> None:
-    """Atomically write *data* to the timetable at *filepath*.
-
-    Temporary file lives beside the target so the replacement stays on the
-    same filesystem; failures clean it up and leave the original untouched.
-    """
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name, suffix=".tmp"
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
+    """Atomically write *data* using the canonical schema persistence path."""
+    save_timetable(data, filepath)
 
 
 def _atomic_restore_raw(filepath: Path, payload: bytes) -> None:

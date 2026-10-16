@@ -20,6 +20,8 @@ from pathlib import Path
 
 from timetable.conflicts import do_overlap
 from timetable.display import WEEKDAYS, parse_time
+from timetable.loader import load_timetable
+from timetable.schema import SchemaError
 
 REQUIRED_COLUMNS = ("day", "subject", "start", "end", "room")
 
@@ -250,19 +252,13 @@ def load_timetable_for_import(path):
         return {day: [] for day in WEEKDAYS}
 
     try:
-        with open(file_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        return load_timetable(file_path)
     except json.JSONDecodeError as exc:
         raise ImportError_(f"invalid JSON in '{file_path}': {exc}") from exc
+    except SchemaError as exc:
+        raise ImportError_(str(exc)) from exc
     except OSError as exc:
         raise ImportError_(f"could not read '{file_path}': {exc}") from exc
-
-    errors = _validate_timetable(data, str(file_path))
-    if errors:
-        raise ImportError_(errors[0])
-    if isinstance(data, dict) and "schema_version" in data and "timetable" in data:
-        return data["timetable"]
-    return data
 
 
 def plan_import(csv_path, timetable_data):

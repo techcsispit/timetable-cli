@@ -619,7 +619,7 @@ class TestLoadTimetableForImport(ImportCsvTestCase):
         path = self.write_json({"monday": "not a list"}, name="bad.json")
         with self.assertRaises(ImportError_) as caught:
             load_timetable_for_import(path)
-        self.assertIn("must be a list", str(caught.exception))
+        self.assertIn("Expected list of classes", str(caught.exception))
 
 
 if __name__ == "__main__":

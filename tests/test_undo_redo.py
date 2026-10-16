@@ -20,6 +20,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from timetable.cli import main
+from timetable.loader import load_timetable
 from timetable.undo import (
     DEFAULT_UNDO_LIMIT,
     ENV_UNDO_LIMIT,
@@ -75,7 +76,7 @@ class UndoTestCase(unittest.TestCase):
         return path
 
     def read_timetable(self, path):
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return load_timetable(path)
 
     def journal_path(self, timetable):
         return undo_history_path(timetable)
@@ -101,6 +102,32 @@ class UndoTestCase(unittest.TestCase):
 
 class TestCommitMutation(UndoTestCase):
     """Core transactional commit semantics."""
+
+    def test_commit_accepts_canonical_versioned_timetable(self):
+        original = {
+            "schema_version": 1,
+            **json.loads(json.dumps(BASE)),
+            "metadata": {"term": "Fall 2026"},
+        }
+        tt = self.write_timetable(original)
+        original_bytes = tt.read_bytes()
+        new = json.loads(json.dumps(BASE))
+        new["monday"].append(slot("Algorithms", "11:00", "12:00", "R2"))
+
+        entry = commit_mutation(tt, "add", new)
+
+        self.assertEqual(entry["snapshot"], original)
+        saved = json.loads(tt.read_text(encoding="utf-8"))
+        self.assertEqual(saved["schema_version"], 1)
+        self.assertEqual(saved["monday"][-1]["subject"], "Algorithms")
+
+        undo_last(tt)
+        self.assertEqual(tt.read_bytes(), original_bytes)
+
+        redo_last(tt)
+        redone = json.loads(tt.read_text(encoding="utf-8"))
+        self.assertEqual(redone["schema_version"], 1)
+        self.assertEqual(redone["monday"][-1]["subject"], "Algorithms")
 
     def test_commit_writes_journal_and_timetable(self):
         tt = self.write_timetable(BASE)
@@ -226,7 +253,7 @@ class TestUndoRedo(UndoTestCase):
         states = [BASE]
         for i, name in enumerate(["A", "B", "C"]):
             states.append(
-                self._mutate(tt, name, start=f"0{7 + i}:00", end=f"0{8 + i}:00")
+                self._mutate(tt, name, start=f"{7 + i:02d}:00", end=f"{8 + i:02d}:00")
             )
         # states = [BASE, s1, s2, s3]; current is s3.
         undo_last(tt)
@@ -243,7 +270,7 @@ class TestUndoRedo(UndoTestCase):
         states = [BASE]
         for i, name in enumerate(["A", "B", "C"]):
             states.append(
-                self._mutate(tt, name, start=f"0{7 + i}:00", end=f"0{8 + i}:00")
+                self._mutate(tt, name, start=f"{7 + i:02d}:00", end=f"{8 + i:02d}:00")
             )
         undo_last(tt)
         undo_last(tt)
@@ -443,7 +470,7 @@ class TestHistoryLimits(UndoTestCase):
         states = [BASE]
         for i, name in enumerate(["A", "B", "C"]):
             state = json.loads(json.dumps(states[-1]))
-            state["monday"].append(slot(name, f"0{7 + i}:00", f"0{8 + i}:00", "R"))
+            state["monday"].append(slot(name, f"{7 + i:02d}:00", f"{8 + i:02d}:00", "R"))
             commit_mutation(tt, "add", state, limit=3)
             states.append(state)
         # limit=3 total: 4 commits -> oldest undo entry pruned.
@@ -464,7 +491,7 @@ class TestHistoryLimits(UndoTestCase):
         states = [BASE]
         for i, name in enumerate(["A", "B"]):
             state = json.loads(json.dumps(states[-1]))
-            state["monday"].append(slot(name, f"0{7 + i}:00", f"0{8 + i}:00", "R"))
+            state["monday"].append(slot(name, f"{7 + i:02d}:00", f"{8 + i:02d}:00", "R"))
             commit_mutation(tt, "add", state, limit=10)
             states.append(state)
         undo_last(tt)  # redo has 1 entry, undo has 1 entry
