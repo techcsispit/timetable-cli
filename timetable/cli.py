@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.schema import SchemaError
@@ -82,6 +82,8 @@ from timetable.undo import (
     redo_last,
     undo_last,
 )
+from timetable.locking import ConcurrentModificationError, LockTimeoutError, TimetableFileLock
+from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
 
 
 def validate_day(day_str):
@@ -244,6 +246,8 @@ def _write_timetable_with_snapshot(
     filepath: Path,
     operation: str,
     previous: Dict[str, Any],
+    expected_revision: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> str:
     """Snapshot *previous*, then atomically write *data* to *filepath*.
 
@@ -253,11 +257,20 @@ def _write_timetable_with_snapshot(
     and the write is atomic so a failure never leaves a partially written
     timetable behind.  Returns the snapshot id.
     """
-    snapshot_id = _save_snapshot_before_file_write(
-        previous, filepath=filepath, operation=operation
-    )
-    _atomic_save_timetable(data, filepath)
-    return snapshot_id
+    with TimetableFileLock(filepath, timeout=lock_timeout):
+        if expected_revision is not None:
+            snap = load_timetable_snapshot(filepath, validate=False)
+            if snap.revision != expected_revision:
+                raise ConcurrentModificationError(
+                    filepath,
+                    expected_revision=expected_revision,
+                    current_revision=snap.revision,
+                )
+        snapshot_id = _save_snapshot_before_file_write(
+            previous, filepath=filepath, operation=operation
+        )
+        _atomic_save_timetable(data, filepath)
+        return snapshot_id
 
 
 def cmd_history(args):
@@ -319,10 +332,12 @@ def cmd_restore(args):
         return 1
 
     try:
+        active_snap = load_timetable_snapshot(args.file, validate=False)
         result = restore_snapshot(
             args.snapshot_id,
             filepath=Path(args.file),
             history_dir=history_dir,
+            expected_revision=active_snap.revision,
         )
     except (
         SnapshotNotFoundError,
@@ -401,7 +416,8 @@ def cmd_add(args):
         print(f"Error: Class ends before or at its start time ({args.start} to {args.end}).", file=sys.stderr)
         sys.exit(1)
 
-    data = load_timetable(args.file)
+    snapshot = load_timetable_snapshot(args.file)
+    data = snapshot.data
     previous_state = copy.deepcopy(data)
     if day not in data:
         data[day] = []
@@ -435,7 +451,13 @@ def cmd_add(args):
         operation="add",
     )
     try:
-        commit_mutation(Path(args.file), "add", data)
+        commit_mutation(
+            Path(args.file),
+            "add",
+            data,
+            canonicalize=True,
+            expected_revision=snapshot.revision,
+        )
     except (HistoryFileError, NoOpError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -507,6 +529,7 @@ def cmd_import_csv(args):
     """Imports classes from a CSV file, with optional dry-run preview."""
     try:
         timetable_data = load_timetable_for_import(args.file)
+        snapshot = load_timetable_snapshot(args.file, validate=False)
         plan = plan_import(args.csv_file, timetable_data)
     except ImportError_ as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -527,7 +550,12 @@ def cmd_import_csv(args):
 
     updated = apply_import(timetable_data, plan)
     try:
-        commit_mutation(Path(args.file), "import-csv", updated)
+        commit_mutation(
+            Path(args.file),
+            "import-csv",
+            updated,
+            expected_revision=snapshot.revision,
+        )
     except (HistoryFileError, NoOpError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -570,6 +598,7 @@ def cmd_import_ics(args):
         sys.exit(1)
 
     try:
+        snapshot = load_timetable_snapshot(args.file)
         timetable_data = load_timetable_for_import(args.file)
         plan = plan_ics_import(
             args.ics_file,
@@ -607,6 +636,7 @@ def cmd_import_ics(args):
             filepath=target_file,
             operation="import-ics",
             previous=previous_state,
+            expected_revision=snapshot.revision,
         )
     except OSError as exc:
         print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
@@ -658,6 +688,7 @@ def cmd_merge(args):
 
     if output_path:
         output_file = Path(output_path)
+        output_snap = load_timetable_snapshot(output_file, validate=False)
         # Keep the existing `history` snapshot when the output file already
         # holds readable content (matches the previous behavior).
         if output_file.exists():
@@ -672,7 +703,12 @@ def cmd_merge(args):
                     operation="merge",
                 )
         try:
-            commit_mutation(output_file, "merge", merged_data)
+            commit_mutation(
+                output_file,
+                "merge",
+                merged_data,
+                expected_revision=output_snap.revision,
+            )
         except (HistoryFileError, NoOpError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -1133,6 +1169,12 @@ def main():
     try:
         result = args.func(args)
     except SchemaError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ConcurrentModificationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except LockTimeoutError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 

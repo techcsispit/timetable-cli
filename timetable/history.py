@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
+from timetable.locking import ConcurrentModificationError, TimetableFileLock
+from timetable.revision import load_timetable_snapshot
 from timetable.display import WEEKDAYS, render_day
 
 #: Default retention limit. The newest this many snapshots are kept.
@@ -306,11 +308,14 @@ def _validate_timetable_structure(data: Any, snapshot_id: str) -> None:
         )
     target = data
     if "schema_version" in data:
-        if "timetable" not in data or not isinstance(data["timetable"], dict):
-            raise SnapshotCorruptError(
-                "Snapshot '%s' versioned timetable is missing 'timetable' object." % (snapshot_id,)
-            )
-        target = data["timetable"]
+        if "timetable" in data:
+            if not isinstance(data["timetable"], dict):
+                raise SnapshotCorruptError(
+                    "Snapshot '%s' versioned timetable is missing 'timetable' object." % (snapshot_id,)
+                )
+            target = data["timetable"]
+        else:
+            target = {k: v for k, v in data.items() if k not in ("schema_version", "metadata")}
 
     for day, slots in target.items():
         if not isinstance(day, str):
@@ -498,6 +503,8 @@ def restore_snapshot(
     *,
     filepath: Optional[Path] = None,
     history_dir: Optional[Path] = None,
+    expected_revision: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Restore a snapshot into the active timetable file.
 
@@ -507,44 +514,55 @@ def restore_snapshot(
     history_dir = history_dir or history_directory(filepath)
     timetable_file = Path(filepath) if filepath is not None else DEFAULT_FILEPATH
 
-    # 1. Locate and validate the requested snapshot.
-    try:
-        document = load_snapshot(snapshot_id, history_dir)
-    except SnapshotNotFoundError:
-        raise
-    except SnapshotCorruptError as exc:
-        raise SnapshotCorruptError("Cannot restore '%s': %s" % (snapshot_id, exc)) from exc
+    with TimetableFileLock(timetable_file, timeout=lock_timeout):
+        # 0. Check revision under the lock if expected_revision was specified
+        if expected_revision is not None:
+            active_snap = load_timetable_snapshot(timetable_file, validate=False)
+            if active_snap.revision != expected_revision:
+                raise ConcurrentModificationError(
+                    timetable_file,
+                    expected_revision=expected_revision,
+                    current_revision=active_snap.revision,
+                )
 
-    # A snapshot may only replace the timetable it was taken from; timetables
-    # in the same folder share one history directory.
-    _require_same_timetable(document["metadata"], snapshot_id, timetable_file)
+        # 1. Locate and validate the requested snapshot.
+        try:
+            document = load_snapshot(snapshot_id, history_dir)
+        except SnapshotNotFoundError:
+            raise
+        except SnapshotCorruptError as exc:
+            raise SnapshotCorruptError("Cannot restore '%s': %s" % (snapshot_id, exc)) from exc
 
-    restored_timetable = document["timetable"]
+        # A snapshot may only replace the timetable it was taken from; timetables
+        # in the same folder share one history directory.
+        _require_same_timetable(document["metadata"], snapshot_id, timetable_file)
 
-    # 2. Validate the restored timetable structure.
-    _validate_timetable_structure(restored_timetable, snapshot_id)
+        restored_timetable = document["timetable"]
 
-    # 3. Preserve the current active timetable as a recoverable snapshot before
-    #    overwriting it.  This works even when the active timetable does not
-    #    yet exist: loading a missing file yields the default empty structure.
-    existing = load_timetable(timetable_file)
-    _preserve_current_timetable(
-        existing, timetable_file, history_dir, operation="restore-previous"
-    )
+        # 2. Validate the restored timetable structure.
+        _validate_timetable_structure(restored_timetable, snapshot_id)
 
-    # 4. Write the restored timetable safely (atomic replacement): a temporary
-    #    file is written first and renamed over the target, so a failed write
-    #    can never leave the active timetable truncated or corrupted.
-    try:
-        _write_atomic(
-            timetable_file,
-            json.dumps(restored_timetable, indent=2).encode("utf-8"),
+        # 3. Preserve the current active timetable as a recoverable snapshot before
+        #    overwriting it.  This works even when the active timetable does not
+        #    yet exist: loading a missing file yields the default empty structure.
+        existing = load_timetable(timetable_file)
+        _preserve_current_timetable(
+            existing, timetable_file, history_dir, operation="restore-previous"
         )
-    except (OSError, TypeError, ValueError) as exc:
-        raise WriteFailureError("Could not write restored timetable: %s" % (exc,)) from exc
 
-    # 5./6. Success only after the file has been written.
-    return {"id": snapshot_id, "restored": True}
+        # 4. Write the restored timetable safely (atomic replacement): a temporary
+        #    file is written first and renamed over the target, so a failed write
+        #    can never leave the active timetable truncated or corrupted.
+        try:
+            _write_atomic(
+                timetable_file,
+                json.dumps(restored_timetable, indent=2).encode("utf-8"),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise WriteFailureError("Could not write restored timetable: %s" % (exc,)) from exc
+
+        # 5./6. Success only after the file has been written.
+        return {"id": snapshot_id, "restored": True}
 
 
 def _preserve_current_timetable(

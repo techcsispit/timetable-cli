@@ -29,11 +29,14 @@ def validate_timetable_structure(data, source_name="timetable"):
 
     target = data
     if "schema_version" in data:
-        if "timetable" not in data or not isinstance(data["timetable"], dict):
-            raise MergeError(
-                f"Invalid timetable in '{source_name}': expected 'timetable' object in versioned timetable."
-            )
-        target = data["timetable"]
+        if "timetable" in data:
+            if not isinstance(data["timetable"], dict):
+                raise MergeError(
+                    f"Invalid timetable in '{source_name}': expected 'timetable' object in versioned timetable."
+                )
+            target = data["timetable"]
+        else:
+            target = {k: v for k, v in data.items() if k not in ("schema_version", "metadata")}
 
     for day, slots in target.items():
         if not isinstance(day, str):
@@ -68,6 +71,7 @@ def load_timetable_for_merge(path):
         raise MergeError(str(exc)) from exc
     except OSError as exc:
         raise MergeError(f"Could not read '{file_path}': {exc}") from exc
+
 
 
 def canonicalize_slot(slot):

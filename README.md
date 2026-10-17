@@ -1,10 +1,16 @@
 # timetable-cli
 
-Your weekly class timetable in the terminal. A command-line tool in plain Python with no dependencies. The timetable is saved in `timetable.json`.
+Your weekly class timetable in the terminal. A command-line tool in Python with cross-process concurrency safety. The timetable is saved in `timetable.json`.
 
-## Running it
+## Installation & Running it
 
-You need Python 3.8 or newer.
+You need Python 3.8 or newer. Install dependencies using `requirements.txt`:
+
+```
+pip install -r requirements.txt
+```
+
+Run commands with:
 
 ```
 python3 -m timetable show monday
@@ -19,6 +25,7 @@ python3 -m timetable import-csv semester.csv --dry-run
 python3 -m timetable import-csv semester.csv
 python3 -m unittest discover tests
 ```
+
 
 On Windows, use `python` instead of `python3`.
 
@@ -403,11 +410,44 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - **Mutating operations** (`add`, `merge`, `restore`): Safely migrate valid legacy files to version 1 upon saving using atomic file writes.
 - **Safety**: Malformed data or future unsupported schema versions (e.g. `schema_version: 99`) are rejected with clear, actionable validation error paths (`Invalid timetable at <path>: <message>`) and never overwritten or silently coerced.
 
+## Concurrency Safety & Optimistic Locking
+
+`timetable-cli` implements robust cross-process concurrency safety and optimistic locking to prevent concurrent CLI executions from silently overwriting one another's updates.
+
+### Cross-Process File Locking
+
+- Every mutation path (`add`, `import-csv`, `import-ics`, `merge`, `restore`, `undo`, `redo`) acquires a cross-process file lock on the target timetable before writing.
+- **Lock mechanism**: Built on OS-level primitives (`msvcrt` on Windows, `fcntl` on POSIX) via a canonical lock path (e.g. `<target>.lock`), normalized by absolute path and filesystem casing.
+- **Lock persistence**: Lock files are retained on release rather than unlinked, eliminating file-descriptor and inode reuse race conditions. Runtime lock files (`*.lock`) are coordination files and should not be edited or deleted during operation.
+- **Configurable timeout**: Acquisition timeout defaults to 10.0 seconds and can be configured with the `TIMETABLE_LOCK_TIMEOUT` environment variable. If another process holds the lock beyond this threshold, the command aborts cleanly with exit code `1` and an informative timeout message.
+
+### Cryptographic Revision Tokens
+
+- Every timetable read captures a cryptographic fingerprint (SHA-256 digest) of the exact persisted file bytes.
+- The revision token distinguishes:
+  - Valid existing file contents (`sha256(...)`)
+  - Absent/uncreated files (`"absent"`)
+  - Concurrent modifications, additions, or deletions
+- Revisions are computed from raw bytes rather than modified timestamps or in-memory normalized structures.
+
+### Atomic Compare-and-Write
+
+- Mutating commands execute an atomic compare-and-write workflow protected under the file lock:
+  1. Acquire target file lock.
+  2. Read current persisted state and compute actual revision.
+  3. Compare current revision against the `expected_revision` captured during initial command load.
+  4. If revisions do not match, abort immediately with `ConcurrentModificationError` (exit code `1`), instructing the user to reload and retry.
+  5. Validate invariants and serialize proposed changes to a temporary file in the destination directory.
+  6. Atomically update undo journal / snapshots and replace the timetable file (`os.replace`).
+- Stale writes are rejected before any history or undo/redo entries are recorded, ensuring failed operations leave data and journal state untouched.
+
 
 ## Code
 
 - `timetable/schema.py`: canonical schema definitions, strict validation, and migration framework
 - `timetable/loader.py`: reading and writing `timetable.json` safely and atomically
+- `timetable/locking.py`: cross-process file locking abstraction and timeout management
+- `timetable/revision.py`: cryptographic file revision tokens and snapshot loading
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file

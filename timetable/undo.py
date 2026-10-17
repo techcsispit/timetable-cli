@@ -1,4 +1,4 @@
-﻿"""Transactional undo/redo history for timetable mutations.
+"""Transactional undo/redo history for timetable mutations.
 
 Persistent, snapshot-based undo/redo journal described in issue #44.  Free of
 CLI coupling (like :mod:`timetable.history`); argument parsing and exit codes
@@ -40,6 +40,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from timetable.loader import DEFAULT_FILEPATH, load_timetable, save_timetable
+from timetable.locking import ConcurrentModificationError, TimetableFileLock
+from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
+from timetable.schema import create_canonical_timetable, is_versioned_format
+
 
 #: Journal schema version written by this module.
 JOURNAL_VERSION = 1
@@ -532,28 +536,22 @@ def commit_mutation(
     new_data: Dict[str, Any],
     *,
     limit: Optional[int] = None,
+    canonicalize: bool = False,
+    expected_revision: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Persist *new_data* as a successful mutation of *filepath*.
 
     Single shared entry point for every mutating command:
 
-    1. Loads the current timetable (the caller already validated the
-       requested mutation against existing business rules and produced
-       *new_data* as the proposed next state).
-    2. Validates the proposed state structurally and raises
-       :class:`NoOpError` when it equals the current state, so a no-op never
-       creates a history entry and never clears the redo stack.
-    3. Writes the journal first (undo entry pushed, redo cleared, pruned),
-       then atomically replaces the timetable.  If the timetable write fails,
-       the journal write is rolled back so a failed mutation leaves both
-       files unchanged.
-    4. Returns the created entry only after both writes succeeded, so callers
-       report success only once the operation completed.
-
-    A crash *between* the two successful writes leaves the journal one step
-    ahead of the timetable (an extra undo step that restores the pre-mutation
-    state); see the README for the recovery procedure.  This function does not
-    provide a full multi-file transaction.
+    1. Acquires a cross-process lock on the target timetable file.
+    2. Reads current state and raw bytes under the lock, computing the current revision.
+    3. If *expected_revision* is provided, verifies that the current revision matches;
+       otherwise raises :class:`ConcurrentModificationError`.
+    4. Validates proposed state structurally and raises :class:`NoOpError` when it equals
+       the current state.
+    5. Writes the journal first, then atomically replaces the timetable.
+    6. Releases the lock upon completion or error.
     """
     if limit is None:
         limit = default_undo_limit()
@@ -562,73 +560,82 @@ def commit_mutation(
     if not isinstance(operation, str) or not operation:
         raise HistoryFileError("Mutation operation must be a non-empty string.")
 
-    timetable_path = _resolved_timetable_path(filepath)
-    previous = load_timetable(filepath)
-    _validate_snapshot(previous, "current timetable")
-    _validate_snapshot(new_data, "proposed timetable")
+    with TimetableFileLock(filepath, timeout=lock_timeout):
+        timetable_path = _resolved_timetable_path(filepath)
 
-    if _canonical_bytes(previous) == _canonical_bytes(new_data):
-        raise NoOpError(
-            "The requested change would not modify the timetable; nothing was "
-            "written and history was left unchanged."
-        )
+        # Check revision under the lock if expected_revision was specified
+        if expected_revision is not None:
+            snapshot = load_timetable_snapshot(filepath, validate=False)
+            if snapshot.revision != expected_revision:
+                raise ConcurrentModificationError(
+                    filepath,
+                    expected_revision=expected_revision,
+                    current_revision=snapshot.revision,
+                )
 
-    journal_path = undo_history_path(filepath)
-    existed_before = journal_path.exists()
-    before: Optional[Dict[str, Any]] = None
-    if existed_before:
-        before = load_journal(filepath, limit=limit)
+        previous_raw = _read_current_raw(filepath)
+        if previous_raw is not None:
+            try:
+                previous_snapshot = json.loads(previous_raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise HistoryFileError(
+                    "Current timetable %s is not valid UTF-8 JSON: %s"
+                    % (filepath, exc)
+                ) from exc
+            _validate_snapshot(previous_snapshot, "current timetable document")
+            previous = previous_snapshot
+        else:
+            previous = load_timetable(filepath)
+            previous_snapshot = previous
 
-    # Exact previous bytes (when readable) so undo can restore them verbatim.
-    # The journal's parsed snapshot must describe those exact bytes, not the
-    # normalized weekday mapping returned by ``load_timetable``.  Versioned
-    # documents contain schema metadata that normalization intentionally
-    # removes, and pairing their raw bytes with the normalized mapping would
-    # make an otherwise valid journal entry fail its own consistency check.
-    previous_raw = _read_current_raw(filepath)
-    if previous_raw is not None:
+        _validate_snapshot(previous, "current timetable")
+        _validate_snapshot(new_data, "proposed timetable")
+
+        if _canonical_bytes(previous) == _canonical_bytes(new_data):
+            raise NoOpError(
+                "The requested change would not modify the timetable; nothing was "
+                "written and history was left unchanged."
+            )
+
+        journal_path = undo_history_path(filepath)
+        existed_before = journal_path.exists()
+        before: Optional[Dict[str, Any]] = None
+        if existed_before:
+            before = load_journal(filepath, limit=limit)
+
+        document = before if before is not None else _empty_journal(timetable_path, limit)
+        entry = _make_entry(operation, previous_snapshot, timetable_path, previous_raw)
+        document["undo"].append(entry)
+        document["redo"] = []
+        _prune(document, limit)
+
+        # 1. Journal first: a crash after this point leaves an extra undo step
+        #    rather than a lost previous state.
         try:
-            previous_snapshot = json.loads(previous_raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
+            save_journal(document, filepath)
+        except OSError as exc:
+            # Roll back the journal so a failed history write leaves neither
+            # the timetable nor history changed.  Any corruption left by the
+            # partially written journal is best-effort repaired or deleted.
+            _rollback_journal(journal_path, before, existed_before)
             raise HistoryFileError(
-                "Current timetable %s is not valid UTF-8 JSON: %s"
-                % (filepath, exc)
+                "Could not write undo history %s: %s" % (journal_path, exc)
             ) from exc
-        _validate_snapshot(previous_snapshot, "current timetable document")
-    else:
-        previous_snapshot = previous
 
-    document = before if before is not None else _empty_journal(timetable_path, limit)
-    entry = _make_entry(operation, previous_snapshot, timetable_path, previous_raw)
-    document["undo"].append(entry)
-    document["redo"] = []
-    _prune(document, limit)
+        # 2. Atomically replace the timetable; repair the journal if this fails so
+        #    a failed mutation changes neither the timetable nor history.
+        try:
+            to_write = create_canonical_timetable(new_data) if canonicalize else new_data
+            _atomic_replace_timetable(filepath, to_write)
+        except Exception as exc:
+            _rollback_journal(journal_path, before, existed_before)
+            raise HistoryFileError(
+                "Could not write timetable %s: %s (the undo history was left "
+                "unchanged)" % (filepath, exc)
+            ) from exc
 
-    # 1. Journal first: a crash after this point leaves an extra undo step
-    #    rather than a lost previous state.
-    try:
-        save_journal(document, filepath)
-    except OSError as exc:
-        # Roll back the journal so a failed history write leaves neither
-        # the timetable nor history changed.  Any corruption left by the
-        # partially written journal is best-effort repaired or deleted.
-        _rollback_journal(journal_path, before, existed_before)
-        raise HistoryFileError(
-            "Could not write undo history %s: %s" % (journal_path, exc)
-        ) from exc
+        return entry
 
-    # 2. Atomically replace the timetable; repair the journal if this fails so
-    #    a failed mutation changes neither the timetable nor history.
-    try:
-        _atomic_replace_timetable(filepath, new_data)
-    except Exception as exc:
-        _rollback_journal(journal_path, before, existed_before)
-        raise HistoryFileError(
-            "Could not write timetable %s: %s (the undo history was left "
-            "unchanged)" % (filepath, exc)
-        ) from exc
-
-    return entry
 
 
 
@@ -677,7 +684,12 @@ def _rollback_journal(
         pass
 
 
-def undo_last(filepath: Path, *, limit: Optional[int] = None) -> Dict[str, Any]:
+def undo_last(
+    filepath: Path,
+    *,
+    limit: Optional[int] = None,
+    lock_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
     """Restore the state immediately before the latest successful mutation.
 
     The entry is moved to the redo stack only after the timetable was restored
@@ -687,120 +699,127 @@ def undo_last(filepath: Path, *, limit: Optional[int] = None) -> Dict[str, Any]:
     with an actionable message when there is nothing to undo or when the
     journal is invalid.
     """
-    timetable_path = _resolved_timetable_path(filepath)
-    journal = load_journal(filepath, limit=limit)
-    if not journal["undo"]:
-        raise HistoryFileError(
-            "Nothing to undo: no recorded changes for '%s'." % (timetable_path,)
-        )
+    with TimetableFileLock(filepath, timeout=lock_timeout):
+        timetable_path = _resolved_timetable_path(filepath)
+        journal = load_journal(filepath, limit=limit)
+        if not journal["undo"]:
+            raise HistoryFileError(
+                "Nothing to undo: no recorded changes for '%s'." % (timetable_path,)
+            )
 
-    entry = journal["undo"][-1]
-    snapshot = entry["snapshot"]
-    _validate_snapshot(snapshot, "undo entry '%s'" % (entry["id"],))
+        entry = journal["undo"][-1]
+        snapshot = entry["snapshot"]
+        _validate_snapshot(snapshot, "undo entry '%s'" % (entry["id"],))
 
-    # Decode the exact bytes to restore now, before touching anything, so a
-    # corrupt entry can never partially modify the timetable.
-    raw_bytes = _str_to_raw(entry["raw"], "undo entry '%s'" % (entry["id"],))
+        # Decode the exact bytes to restore now, before touching anything, so a
+        # corrupt entry can never partially modify the timetable.
+        raw_bytes = _str_to_raw(entry["raw"], "undo entry '%s'" % (entry["id"],))
 
-    # 1. Remember the state we are about to replace (the target for redo),
-    #    captured as raw bytes so redo restores it exactly too.
-    current_raw = _read_current_raw(filepath)
-    try:
-        current = json.loads(current_raw.decode("utf-8")) if current_raw else {}
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise HistoryFileError(
-            "Current timetable %s is not valid UTF-8 JSON: %s" % (filepath, exc)
-        ) from exc
-    _validate_snapshot(current, "current timetable")
-
-    # 2. Restore the timetable first; if this fails, history is untouched.
-    _atomic_restore_raw(filepath, raw_bytes)
-
-    # 3. Only after a successful restoration, move the entry across.
-    journal["undo"].pop()
-    entry["redo_snapshot"] = copy.deepcopy(current)
-    entry["redo_checksum"] = _checksum(current)
-    entry["redo_raw"] = _raw_to_str(current_raw)
-    entry["redo_raw_checksum"] = _raw_checksum(current_raw or b"")
-    journal["redo"].append(entry)
-    try:
-        save_journal(journal, filepath)
-    except Exception:
-        # The timetable was restored but the journal update failed: put the
-        # timetable back so neither file changed, then report the error.
+        # 1. Remember the state we are about to replace (the target for redo),
+        #    captured as raw bytes so redo restores it exactly too.
+        current_raw = _read_current_raw(filepath)
         try:
-            _atomic_restore_raw(filepath, current_raw or b"{}")
+            current = json.loads(current_raw.decode("utf-8")) if current_raw else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HistoryFileError(
+                "Current timetable %s is not valid UTF-8 JSON: %s" % (filepath, exc)
+            ) from exc
+        _validate_snapshot(current, "current timetable")
+
+        # 2. Restore the timetable first; if this fails, history is untouched.
+        _atomic_restore_raw(filepath, raw_bytes)
+
+        # 3. Only after a successful restoration, move the entry across.
+        journal["undo"].pop()
+        entry["redo_snapshot"] = copy.deepcopy(current)
+        entry["redo_checksum"] = _checksum(current)
+        entry["redo_raw"] = _raw_to_str(current_raw)
+        entry["redo_raw_checksum"] = _raw_checksum(current_raw or b"")
+        journal["redo"].append(entry)
+        try:
+            save_journal(journal, filepath)
         except Exception:
-            pass
-        raise
-    return entry
+            # The timetable was restored but the journal update failed: put the
+            # timetable back so neither file changed, then report the error.
+            try:
+                _atomic_restore_raw(filepath, current_raw or b"{}")
+            except Exception:
+                pass
+            raise
+        return entry
 
 
-def redo_last(filepath: Path, *, limit: Optional[int] = None) -> Dict[str, Any]:
+def redo_last(
+    filepath: Path,
+    *,
+    limit: Optional[int] = None,
+    lock_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
     """Reapply the most recently undone state transition.
 
     The entry is moved back to the undo stack only after the timetable was
     restored successfully.  On any failure neither the timetable nor the
     journal is modified.
     """
-    timetable_path = _resolved_timetable_path(filepath)
-    journal = load_journal(filepath, limit=limit)
-    if not journal["redo"]:
-        raise HistoryFileError(
-            "Nothing to redo: no undone changes recorded for '%s'."
-            % (timetable_path,)
-        )
+    with TimetableFileLock(filepath, timeout=lock_timeout):
+        timetable_path = _resolved_timetable_path(filepath)
+        journal = load_journal(filepath, limit=limit)
+        if not journal["redo"]:
+            raise HistoryFileError(
+                "Nothing to redo: no undone changes recorded for '%s'."
+                % (timetable_path,)
+            )
 
-    entry = journal["redo"][-1]
-    target = entry.get("redo_snapshot")
-    if target is None:
-        raise HistoryFileError(
-            "Redo entry '%s' is missing its target state; the history is "
-            "inconsistent." % (entry["id"],)
+        entry = journal["redo"][-1]
+        target = entry.get("redo_snapshot")
+        if target is None:
+            raise HistoryFileError(
+                "Redo entry '%s' is missing its target state; the history is "
+                "inconsistent." % (entry["id"],)
+            )
+        _validate_snapshot(target, "redo entry '%s'" % (entry["id"],))
+        stored = entry.get("redo_checksum")
+        if not isinstance(stored, str) or stored != _checksum(target):
+            raise HistoryFileError(
+                "Redo entry '%s' checksum mismatch; the journal is corrupt."
+                % (entry["id"],)
+            )
+        # Decode the exact bytes to restore now, before touching anything, so a
+        # corrupt entry can never partially modify the timetable.
+        redo_raw = _str_to_raw(
+            entry.get("redo_raw"), "redo entry '%s'" % (entry["id"],)
         )
-    _validate_snapshot(target, "redo entry '%s'" % (entry["id"],))
-    stored = entry.get("redo_checksum")
-    if not isinstance(stored, str) or stored != _checksum(target):
-        raise HistoryFileError(
-            "Redo entry '%s' checksum mismatch; the journal is corrupt."
-            % (entry["id"],)
-        )
-    # Decode the exact bytes to restore now, before touching anything, so a
-    # corrupt entry can never partially modify the timetable.
-    redo_raw = _str_to_raw(
-        entry.get("redo_raw"), "redo entry '%s'" % (entry["id"],)
-    )
-    redo_raw_stored = entry.get("redo_raw_checksum")
-    if not isinstance(redo_raw_stored, str) or (
-        redo_raw_stored != _raw_checksum(redo_raw)
-    ):
-        raise HistoryFileError(
-            "Redo entry '%s' raw checksum mismatch; the journal is corrupt."
-            % (entry["id"],)
-        )
+        redo_raw_stored = entry.get("redo_raw_checksum")
+        if not isinstance(redo_raw_stored, str) or (
+            redo_raw_stored != _raw_checksum(redo_raw)
+        ):
+            raise HistoryFileError(
+                "Redo entry '%s' raw checksum mismatch; the journal is corrupt."
+                % (entry["id"],)
+            )
 
-    # 1. Restore the undone state first; if this fails, history is untouched.
-    _atomic_restore_raw(filepath, redo_raw)
+        # 1. Restore the undone state first; if this fails, history is untouched.
+        _atomic_restore_raw(filepath, redo_raw)
 
-    # 2. Only after a successful restoration, move the entry back.
-    journal["redo"].pop()
-    journal["undo"].append(entry)
-    try:
-        save_journal(journal, filepath)
-    except Exception:
-        # Journal update failed after the timetable was written: restore the
-        # timetable to what it was before this redo attempt, so neither file
-        # changed, then report the error.
+        # 2. Only after a successful restoration, move the entry back.
+        journal["redo"].pop()
+        journal["undo"].append(entry)
         try:
-            previous_raw = _read_current_raw(filepath)
+            save_journal(journal, filepath)
         except Exception:
-            previous_raw = None
-        if previous_raw is not None:
+            # Journal update failed after the timetable was written: restore the
+            # timetable to what it was before this redo attempt, so neither file
+            # changed, then report the error.
             try:
-                _atomic_restore_raw(filepath, previous_raw)
+                previous_raw = _read_current_raw(filepath)
             except Exception:
-                pass
-        raise
-    return entry
+                previous_raw = None
+            if previous_raw is not None:
+                try:
+                    _atomic_restore_raw(filepath, previous_raw)
+                except Exception:
+                    pass
+            raise
+        return entry
 
 
