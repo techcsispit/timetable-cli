@@ -18,7 +18,7 @@ from timetable.free import find_free_slots, render_free_slots
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
-from timetable.conflicts import find_conflicts, render_conflicts
+from timetable.conflicts import do_overlap, find_clashing_slot, find_conflicts, render_conflicts
 from timetable.stats import compute_stats, render_stats
 from timetable.history import (
     DEFAULT_RETENTION_LIMIT,
@@ -127,16 +127,13 @@ def check_clash(slots, start_min, end_min):
     
     Returns the clashing slot dictionary, or None.
     """
+    candidate = {
+        "start": f"{start_min // 60:02d}:{start_min % 60:02d}",
+        "end": f"{end_min // 60:02d}:{end_min % 60:02d}",
+    }
     for slot in slots:
-        try:
-            sh, sm = map(int, slot["start"].split(":"))
-            eh, em = map(int, slot["end"].split(":"))
-            slot_start = sh * 60 + sm
-            slot_end = eh * 60 + em
-            if max(start_min, slot_start) < min(end_min, slot_end):
-                return slot
-        except Exception:
-            continue
+        if do_overlap(candidate, slot):
+            return slot
     return None
 
 
@@ -406,7 +403,13 @@ def cmd_add(args):
     if day not in data:
         data[day] = []
 
-    clashing_slot = check_clash(data[day], start_min, end_min)
+    candidate = {
+        "subject": args.subject,
+        "start": args.start,
+        "end": args.end,
+        "room": args.room,
+    }
+    clashing_slot = find_clashing_slot(data, day, candidate)
     if clashing_slot:
         clash_name = clashing_slot.get("subject", "Existing class")
         clash_time = f"{clashing_slot.get('start')} - {clashing_slot.get('end')}"
@@ -416,12 +419,7 @@ def cmd_add(args):
         )
         sys.exit(1)
 
-    data[day].append({
-        "subject": args.subject,
-        "start": args.start,
-        "end": args.end,
-        "room": args.room
-    })
+    data[day].append(candidate)
     data[day].sort(key=lambda s: s.get("start", ""))
 
     # Snapshot the timetable as it was *before* this addition (kept for the

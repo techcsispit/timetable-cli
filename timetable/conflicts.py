@@ -65,6 +65,38 @@ def _weekly_overlap(interval_a, interval_b):
     return False
 
 
+def find_clashing_slot(data, day, candidate):
+    """Return the first existing slot that overlaps ``candidate``.
+
+    ``day`` identifies where the candidate starts. Unlike full-record
+    equality used for deduplication, this comparison deliberately considers
+    only the weekly intervals, including overnight and week-wrap overlap.
+    """
+    try:
+        candidate_day = WEEKDAYS.index(day.lower())
+        candidate_interval = _weekly_interval(candidate_day, candidate)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    normalized_data = {
+        key.lower(): value
+        for key, value in data.items()
+        if isinstance(key, str) and isinstance(value, list)
+    }
+    for day_index, weekday in enumerate(WEEKDAYS):
+        for slot in normalized_data.get(weekday, []):
+            try:
+                interval = _weekly_interval(day_index, slot)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if _weekly_overlap(candidate_interval, interval):
+                return slot
+    return None
+
+
 def find_conflicts(data):
     """
     Detects scheduling conflicts across days in the timetable.
