@@ -65,6 +65,21 @@ def _weekly_overlap(interval_a, interval_b):
     return False
 
 
+def weekly_slots_overlap(day_a, slot_a, day_b, slot_b):
+    """Return whether two weekday-qualified slots overlap in a weekly cycle.
+
+    Unlike :func:`do_overlap`, this helper preserves each slot's starting
+    weekday.  It therefore detects overlaps caused by an overnight slot
+    continuing into the following day, including Sunday-to-Monday wraparound.
+    """
+    try:
+        interval_a = _weekly_interval(WEEKDAYS.index(day_a.lower()), slot_a)
+        interval_b = _weekly_interval(WEEKDAYS.index(day_b.lower()), slot_b)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return _weekly_overlap(interval_a, interval_b)
+
+
 def find_conflicts(data):
     """
     Detects scheduling conflicts across days in the timetable.

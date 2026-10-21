@@ -359,6 +359,38 @@ class TestConflictDetection(ImportCsvTestCase):
         self.assertEqual(plan.conflicts, [])
         self.assertEqual(len(plan.new_classes), 2)
 
+    def test_conflict_with_previous_day_overnight_existing_class(self):
+        timetable = empty_timetable()
+        timetable["friday"] = [
+            {"subject": "Existing", "start": "23:00", "end": "01:00", "room": "R1"}
+        ]
+        path = self.write_csv(
+            "day,subject,start,end,room\n"
+            "Saturday,Imported,00:30,01:30,R2\n"
+        )
+
+        plan = plan_import(path, timetable)
+
+        self.assertFalse(plan.accepted)
+        self.assertEqual(len(plan.conflicts), 1)
+        self.assertEqual(plan.conflicts[0].first["subject"], "Imported")
+        self.assertEqual(plan.conflicts[0].second["subject"], "Existing")
+
+    def test_sunday_overnight_conflicts_with_monday(self):
+        timetable = empty_timetable()
+        timetable["sunday"] = [
+            {"subject": "Sunday Overnight", "start": "23:30", "end": "00:30", "room": "R1"}
+        ]
+        path = self.write_csv(
+            "day,subject,start,end,room\n"
+            "Monday,Monday Early,00:00,01:00,R2\n"
+        )
+
+        plan = plan_import(path, timetable)
+
+        self.assertFalse(plan.accepted)
+        self.assertEqual(len(plan.conflicts), 1)
+
     def test_boundary_touching_intervals_do_not_conflict(self):
         path = self.write_csv(
             "day,subject,start,end,room\n"

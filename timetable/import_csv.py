@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from timetable.conflicts import do_overlap
+from timetable.conflicts import weekly_slots_overlap
 from timetable.display import WEEKDAYS, parse_time
 from timetable.loader import load_timetable
 from timetable.schema import SchemaError
@@ -49,7 +49,7 @@ class DuplicateEntry:
 
 @dataclass(frozen=True)
 class ConflictPair:
-    """Two overlapping classes on the same day."""
+    """Two overlapping classes in the weekly timetable."""
 
     day: str
     first: dict
@@ -321,17 +321,14 @@ def plan_import(csv_path, timetable_data):
             unique_new.append((row, day, slot))
     plan.new_classes = unique_new
 
-    for day in WEEKDAYS:
-        new_day = [slot for _, entry_day, slot in plan.new_classes if entry_day == day]
-        existing_day = _existing_slots(timetable_data, day)
+    for index, (_, day, first) in enumerate(plan.new_classes):
+        for _, second_day, second in plan.new_classes[index + 1:]:
+            if weekly_slots_overlap(day, first, second_day, second):
+                plan.conflicts.append(ConflictPair(day, first, second))
 
-        for index, first in enumerate(new_day):
-            for second in new_day[index + 1:]:
-                if do_overlap(first, second):
-                    plan.conflicts.append(ConflictPair(day, first, second))
-
-            for existing in existing_day:
-                if do_overlap(first, existing):
+        for existing_day in WEEKDAYS:
+            for existing in _existing_slots(timetable_data, existing_day):
+                if weekly_slots_overlap(day, first, existing_day, existing):
                     plan.conflicts.append(ConflictPair(day, first, existing))
 
     return plan
