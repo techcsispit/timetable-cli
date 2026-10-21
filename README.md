@@ -1,10 +1,16 @@
 # timetable-cli
 
-Your weekly class timetable in the terminal. A command-line tool in plain Python with no dependencies. The timetable is saved in `timetable.json`.
+Your weekly class timetable in the terminal. A command-line tool in Python with cross-process concurrency safety. The timetable is saved in `timetable.json`.
 
-## Running it
+## Installation & Running it
 
-You need Python 3.8 or newer.
+You need Python 3.8 or newer. Install dependencies using `requirements.txt`:
+
+```
+pip install -r requirements.txt
+```
+
+Run commands with:
 
 ```
 python3 -m timetable show monday
@@ -19,6 +25,7 @@ python3 -m timetable import-csv semester.csv --dry-run
 python3 -m timetable import-csv semester.csv
 python3 -m unittest discover tests
 ```
+
 
 On Windows, use `python` instead of `python3`.
 
@@ -226,18 +233,59 @@ Modified:
 
 When the timetables are identical it prints `No changes detected. The timetables are identical.` The command exits with status `0` when the files match and non-zero when they differ or an input is missing/invalid, so it can be used in scripts. Neither input file is modified.
 
-## Merging two timetables
+## Merging timetables
+
+### Two-way merge
 
 ```bash
 python3 -m timetable merge timetable.json timetable-new.json --output merged.json
 ```
 
-`merge` combines two timetable JSON files into a single merged timetable file without modifying either input file.
+Combines two timetable JSON files into a single merged timetable file without modifying either input file.
 
 - **Duplicate handling**: Identical classes (same subject, start time, end time, and room on the same day) are deduplicated so only one instance is kept in the output.
 - **Conflict detection**: Classes occurring on the same day that overlap in time (evaluated using half-open intervals `[start, end)`) are detected as conflicts. If conflicts exist, the operation halts with exit code `1`, prints all conflicting pairs clearly to stderr, and avoids producing a merged file.
 - **Deterministic ordering**: The output merged timetable is deterministically sorted by canonical weekday order (Monday to Sunday) and start time.
-- **Output file safety**: The output path cannot match either input path. If the output file already exists, `merge` will refuse to overwrite it unless `--force` is provided.
+- **Output file safety**: The output path cannot match any input path. If the output file already exists, `merge` will refuse to overwrite it unless `--force` is provided.
+
+### Three-way merge with change-aware conflict detection
+
+```bash
+# Positional syntax: base, ours, theirs
+python3 -m timetable merge base.json ours.json theirs.json --output merged.json
+
+# Alternative flag syntax:
+python3 -m timetable merge ours.json theirs.json --base base.json --output merged.json
+```
+
+Three-way merge reconciles concurrent edits made to a common base timetable across two independent branches (`ours` and `theirs`):
+
+- **Purpose & Workflow**:
+  - `base.json`: The common original timetable snapshot.
+  - `ours.json`: First independently modified version.
+  - `theirs.json`: Second independently modified version.
+  - Computes modifications and deletions on both sides relative to `base`, then reconciles non-conflicting changes automatically into the destination.
+- **Reconciliation Rules**:
+  1. *Unchanged*: If neither side changed an entry, the base entry is retained.
+  2. *Single-side change*: If only one side modified or deleted an entry, that change is applied.
+  3. *Identical change*: If both sides made the same modification or both deleted an entry, the change is applied once cleanly.
+  4. *Compatible field-level edits*: If one side modified the room and the other modified the time slot of the same class, the edits are merged compatibly.
+  5. *Independent additions*: Distinct new classes added on either side are both included. Identical additions on both sides are deduplicated.
+- **Conflict Types**:
+  - **Merge conflicts (structural)**: Incompatible edits to the same field (`modify_vs_modify`), deletion on one side with modification on the other (`delete_vs_modify`), competing additions of the same class (`add_vs_add`), or ambiguous identity matches (`ambiguous_match`).
+  - **Schedule conflicts (semantic)**: Structurally reconcilable additions or modifications that introduce overlapping time slots on the same day in the merged schedule.
+- **Diagnostics & Failure Behavior**:
+  - When merge conflicts or schedule conflicts occur, structured diagnostics describing affected entries, competing values, or overlapping slots are printed to `stderr`, and the process halts with exit code `1`.
+  - The destination file is **never written or partially overwritten** if any conflict occurs.
+  - Neither `base`, `ours`, nor `theirs` input files are ever modified.
+
+### Concurrency Safety: Multi-File Locking and Stale-Source Prevention
+
+To prevent stale-source merges when multiple files are involved in two-way or three-way merges:
+- **Snapshot Capture**: Revisions (SHA-256 fingerprints) of all source inputs (including `base`, `ours`, `theirs` / `first`, `second`) and the destination file (or expected absence) are captured upon initial load.
+- **Deterministic Multi-File Locking**: At the commit boundary, `MultiFileLock` acquires cross-process file locks for all source inputs and destination file simultaneously in a deterministic, globally consistent canonical path order (`os.path.normcase`). This eliminates lock-order deadlocks regardless of the order arguments were passed.
+- **Deduplication & Failure Rollback**: Duplicate or equivalent file paths are deduplicated so files are not locked multiple times. If any lock cannot be acquired within the timeout, all previously acquired locks are immediately released before propagating the error.
+- **Revalidation Under Lock**: Under the multi-file lock, all source revisions and destination revision are re-validated before writing. If any source file was modified concurrently or destination state diverged, the merge aborts with exit code `1` (`ConcurrentModificationError`) without writing or corrupting the destination.
 
 ## Version history and restore
 
@@ -403,11 +451,46 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - **Mutating operations** (`add`, `merge`, `restore`): Safely migrate valid legacy files to version 1 upon saving using atomic file writes.
 - **Safety**: Malformed data or future unsupported schema versions (e.g. `schema_version: 99`) are rejected with clear, actionable validation error paths (`Invalid timetable at <path>: <message>`) and never overwritten or silently coerced.
 
+## Concurrency Safety & Optimistic Locking
+
+`timetable-cli` implements robust cross-process concurrency safety and optimistic locking to prevent concurrent CLI executions from silently overwriting one another's updates.
+
+### Cross-Process File Locking
+
+- Every mutation path (`add`, `import-csv`, `import-ics`, `merge`, `restore`, `undo`, `redo`) acquires a cross-process file lock on the target timetable before writing.
+- **Lock mechanism**: Built on OS-level primitives (`msvcrt` on Windows, `fcntl` on POSIX) via a canonical lock path (e.g. `<target>.lock`), normalized by absolute path and filesystem casing.
+- **Lock persistence**: Lock files are retained on release rather than unlinked, eliminating file-descriptor and inode reuse race conditions. Runtime lock files (`*.lock`) are coordination files and should not be edited or deleted during operation.
+- **Deterministic Multi-File Locking**: Multi-resource operations (`merge`) use `MultiFileLock` to coordinate locks across all input files and destination files in a globally deterministic canonical path order (`os.path.normcase`), preventing deadlocks across concurrent runs.
+- **Rollback on lock failure**: If any lock acquisition in a multi-file sequence times out or fails, all already-acquired locks are immediately released in reverse order before propagating the error.
+- **Configurable timeout**: Acquisition timeout defaults to 10.0 seconds and can be configured with the `TIMETABLE_LOCK_TIMEOUT` environment variable. If another process holds the lock beyond this threshold, the command aborts cleanly with exit code `1` and an informative timeout message.
+
+### Cryptographic Revision Tokens
+
+- Every timetable read captures a cryptographic fingerprint (SHA-256 digest) of the exact persisted file bytes.
+- The revision token distinguishes:
+  - Valid existing file contents (`sha256(...)`)
+  - Absent/uncreated files (`"absent"`)
+  - Concurrent modifications, additions, or deletions
+- Revisions are computed from raw bytes rather than modified timestamps or in-memory normalized structures.
+
+### Atomic Compare-and-Write
+
+- Mutating commands execute an atomic compare-and-write workflow protected under the file lock:
+  1. Acquire target file lock.
+  2. Read current persisted state and compute actual revision.
+  3. Compare current revision against the `expected_revision` captured during initial command load.
+  4. If revisions do not match, abort immediately with `ConcurrentModificationError` (exit code `1`), instructing the user to reload and retry.
+  5. Validate invariants and serialize proposed changes to a temporary file in the destination directory.
+  6. Atomically update undo journal / snapshots and replace the timetable file (`os.replace`).
+- Stale writes are rejected before any history or undo/redo entries are recorded, ensuring failed operations leave data and journal state untouched.
+
 
 ## Code
 
 - `timetable/schema.py`: canonical schema definitions, strict validation, and migration framework
 - `timetable/loader.py`: reading and writing `timetable.json` safely and atomically
+- `timetable/locking.py`: cross-process file locking abstraction and timeout management
+- `timetable/revision.py`: cryptographic file revision tokens and snapshot loading
 - `timetable/display.py`: printing a day or the week, plus time parsing
 - `timetable/now.py`: working out what's on right now
 - `timetable/export.py`: writing the `.ics` calendar file

@@ -219,11 +219,14 @@ def _validate_timetable(data, source):
 
     target = data
     if "schema_version" in data:
-        if "timetable" not in data or not isinstance(data["timetable"], dict):
-            return [
-                f"invalid timetable in '{source}': expected 'timetable' object in versioned timetable"
-            ]
-        target = data["timetable"]
+        if "timetable" in data:
+            if not isinstance(data["timetable"], dict):
+                return [
+                    f"invalid timetable in '{source}': expected 'timetable' object in versioned timetable"
+                ]
+            target = data["timetable"]
+        else:
+            target = {k: v for k, v in data.items() if k not in ("schema_version", "metadata")}
 
     for day, slots in target.items():
         if not isinstance(day, str):

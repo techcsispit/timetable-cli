@@ -34,6 +34,12 @@ CLEAN = {
     for day in BASE
 }
 
+OVERNIGHT = {
+    day: ([{"subject": "Hackathon Lab Prep", "start": "23:00", "end": "01:00", "room": "R9"}]
+          if day == "friday" else [])
+    for day in BASE
+}
+
 
 class CliCommandsTest(unittest.TestCase):
     def write(self, tmp_path, data):
@@ -87,6 +93,67 @@ class CliCommandsTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("Physics", out)
             self.assertIn("Data Structures", out)
+
+    def test_show_reports_positive_overnight_duration(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, OVERNIGHT)
+            code, out, err = self.run_cli("--file", str(path), "show", "friday")
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("23:00 - 01:00", out)
+            self.assertIn("120 min", out)
+            self.assertNotIn("-1320 min", out)
+
+    def test_week_reports_positive_overnight_duration(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, OVERNIGHT)
+            code, out, err = self.run_cli("--file", str(path), "week")
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            self.assertIn("23:00 - 01:00", out)
+            self.assertIn("(120 min)", out)
+            self.assertNotIn("-1320 min", out)
+
+    def test_add_rejects_clash_with_overnight_class(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, OVERNIGHT)
+            before = path.read_bytes()
+            code, out, err = self.run_cli(
+                "--file", str(path), "add",
+                "--day", "friday",
+                "--subject", "Clash",
+                "--start", "22:00",
+                "--end", "23:30",
+                "--room", "R9",
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+            self.assertIn("overlaps with 'Hackathon Lab Prep'", err)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_add_rejects_next_day_clash_with_overnight_class(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, OVERNIGHT)
+            before = path.read_bytes()
+            code, _, err = self.run_cli(
+                "--file", str(path), "add",
+                "--day", "saturday",
+                "--subject", "Early Clash",
+                "--start", "00:30",
+                "--end", "01:30",
+                "--room", "R10",
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("overlaps with 'Hackathon Lab Prep'", err)
+            self.assertEqual(path.read_bytes(), before)
 
     def test_now_reads_given_file(self):
         import tempfile

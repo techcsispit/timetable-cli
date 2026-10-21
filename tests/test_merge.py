@@ -13,6 +13,7 @@ from timetable.cli import main
 from timetable.merge import (
     MergeError,
     load_timetable_for_merge,
+    merge_three_way,
     merge_timetables,
 )
 
@@ -318,6 +319,291 @@ class TestMergeCLI(MergeTestCase):
         finally:
             sys.argv = real_argv
         self.assertIn("Math", out.getvalue())
+
+
+class TestThreeWayMergeLogic(MergeTestCase):
+    """Tests for core three-way merge reconciliation and conflict detection."""
+
+    def test_neither_side_changed_entry(self):
+        """Retain base entry if neither side touched it."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = copy.deepcopy(base)
+        theirs = copy.deepcopy(base)
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 1)
+        self.assertEqual(result.merged_data["monday"][0], make_slot("Math", "09:00", "10:00", "R101"))
+
+    def test_only_ours_changed_entry(self):
+        """Apply change from ours when theirs left it unchanged."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Math", "09:00", "10:00", "R202")]  # Room modified
+        theirs = copy.deepcopy(base)
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(result.merged_data["monday"][0]["room"], "R202")
+
+    def test_only_theirs_changed_entry(self):
+        """Apply change from theirs when ours left it unchanged."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = copy.deepcopy(base)
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Math", "09:30", "10:30", "R101")]  # Time modified
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(result.merged_data["monday"][0]["start"], "09:30")
+        self.assertEqual(result.merged_data["monday"][0]["end"], "10:30")
+
+    def test_both_sides_make_identical_modifications(self):
+        """Both sides made the exact same modification."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Math", "09:00", "10:00", "Lab 1")]
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Math", "09:00", "10:00", "Lab 1")]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 1)
+        self.assertEqual(result.merged_data["monday"][0]["room"], "Lab 1")
+
+    def test_both_sides_make_compatible_field_changes(self):
+        """Ours changed room, theirs changed time of the same class."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Math", "09:00", "10:00", "Lab 1")]  # Changed room
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Math", "09:30", "10:30", "R101")]  # Changed time
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 1)
+        self.assertEqual(result.merged_data["monday"][0], make_slot("Math", "09:30", "10:30", "Lab 1"))
+
+    def test_both_sides_make_incompatible_modifications(self):
+        """Both sides modified the same field to different values."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Math", "09:00", "10:00", "Room A")]
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Math", "09:00", "10:00", "Room B")]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.has_conflicts)
+        self.assertEqual(len(result.merge_conflicts), 1)
+        self.assertEqual(result.merge_conflicts[0].conflict_type, "modify_vs_modify")
+
+    def test_both_sides_delete_same_entry(self):
+        """Compatible deletion: entry removed on both sides."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()
+        theirs = empty_timetable()
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 0)
+
+    def test_one_side_deletes_other_leaves_unchanged(self):
+        """Entry deleted on one side and untouched on the other is deleted."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()  # Deleted
+        theirs = copy.deepcopy(base)  # Untouched
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 0)
+
+    def test_one_side_deletes_other_modifies_conflict(self):
+        """Delete-vs-modify conflict when one side deletes and other modifies."""
+        base = empty_timetable()
+        base["monday"] = [make_slot("Math", "09:00", "10:00", "R101")]
+        ours = empty_timetable()  # Deleted
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Math", "09:00", "10:00", "Room 999")]  # Modified
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.has_conflicts)
+        self.assertEqual(len(result.merge_conflicts), 1)
+        self.assertEqual(result.merge_conflicts[0].conflict_type, "delete_vs_modify")
+
+    def test_both_sides_independently_add_same_entry(self):
+        """Both sides independently added identical entry: deduplicated cleanly."""
+        base = empty_timetable()
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Physics", "11:00", "12:00", "Lab 2")]
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Physics", "11:00", "12:00", "Lab 2")]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 1)
+        self.assertEqual(result.merged_data["monday"][0]["subject"], "Physics")
+
+    def test_both_sides_independently_add_distinct_entries(self):
+        """Both sides added distinct, non-overlapping classes."""
+        base = empty_timetable()
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Physics", "11:00", "12:00", "Lab 2")]
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("Chemistry", "14:00", "15:00", "Lab 3")]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.merged_data["monday"]), 2)
+        subjects = [s["subject"] for s in result.merged_data["monday"]]
+        self.assertEqual(subjects, ["Physics", "Chemistry"])
+
+    def test_independent_additions_create_schedule_overlap(self):
+        """Both sides add non-identical entries that overlap in time (schedule conflict)."""
+        base = empty_timetable()
+        ours = empty_timetable()
+        ours["monday"] = [make_slot("Bio", "10:00", "11:30", "Lab 1")]
+        theirs = empty_timetable()
+        theirs["monday"] = [make_slot("History", "11:00", "12:00", "Room 5")]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.has_conflicts)
+        self.assertEqual(len(result.merge_conflicts), 0)
+        self.assertGreater(len(result.schedule_conflicts), 0)
+
+    def test_modification_conflicts_with_entry_on_other_side(self):
+        """A modification on one side collides with a class on the other side."""
+        base = empty_timetable()
+        base["monday"] = [
+            make_slot("Math", "09:00", "10:00", "R101"),
+            make_slot("Physics", "11:00", "12:00", "R102"),
+        ]
+        ours = copy.deepcopy(base)
+        # Theirs moves Math to 11:00-12:00
+        theirs = empty_timetable()
+        theirs["monday"] = [
+            make_slot("Math", "11:00", "12:00", "R101"),
+            make_slot("Physics", "11:00", "12:00", "R102"),
+        ]
+
+        result = merge_three_way(base, ours, theirs)
+        self.assertTrue(result.has_conflicts)
+        self.assertGreater(len(result.schedule_conflicts), 0)
+
+    def test_deterministic_result_independent_of_input_ordering(self):
+        """Entry order in JSON arrays does not affect three-way merge output."""
+        base = empty_timetable()
+        base["monday"] = [
+            make_slot("Math", "09:00", "10:00", "R101"),
+            make_slot("Physics", "11:00", "12:00", "R102"),
+        ]
+        ours1 = empty_timetable()
+        ours1["monday"] = [
+            make_slot("Math", "09:00", "10:00", "R101"),
+            make_slot("Physics", "11:00", "12:00", "R102"),
+            make_slot("Chem", "14:00", "15:00", "R103"),
+        ]
+        ours2 = empty_timetable()
+        ours2["monday"] = [
+            make_slot("Chem", "14:00", "15:00", "R103"),
+            make_slot("Physics", "11:00", "12:00", "R102"),
+            make_slot("Math", "09:00", "10:00", "R101"),
+        ]
+        theirs = copy.deepcopy(base)
+
+        res1 = merge_three_way(base, ours1, theirs)
+        res2 = merge_three_way(base, ours2, theirs)
+        self.assertEqual(res1.merged_data, res2.merged_data)
+
+
+class TestThreeWayMergeCLI(MergeTestCase):
+    """Tests for CLI three-way merge command and options."""
+
+    def test_cli_three_way_merge_positional(self):
+        """CLI merge base ours theirs --output."""
+        base = self.write_json("base.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
+        ours = self.write_json("ours.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]})
+        theirs = self.write_json("theirs.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")], "tuesday": [make_slot("Physics", "10:00", "11:00", "R102")]})
+        out_p = self.temp / "merged.json"
+
+        code, out, err = self.run_merge(str(base), str(ours), str(theirs), "--output", str(out_p))
+        self.assertEqual(code, 0)
+        self.assertIn("Successfully merged timetables into", out)
+
+        merged = json.loads(out_p.read_text(encoding="utf-8"))
+        self.assertEqual(merged["monday"][0]["room"], "Lab 1")
+        self.assertEqual(len(merged["tuesday"]), 1)
+
+    def test_cli_three_way_merge_with_base_flag(self):
+        """CLI merge ours theirs --base base --output."""
+        base = self.write_json("base.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
+        ours = self.write_json("ours.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]})
+        theirs = self.write_json("theirs.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
+        out_p = self.temp / "merged.json"
+
+        code, out, err = self.run_merge(str(ours), str(theirs), "--base", str(base), "--output", str(out_p))
+        self.assertEqual(code, 0)
+        self.assertIn("Successfully merged timetables into", out)
+
+        merged = json.loads(out_p.read_text(encoding="utf-8"))
+        self.assertEqual(merged["monday"][0]["room"], "Lab 1")
+
+    def test_cli_three_way_merge_conflict_aborts_without_overwriting(self):
+        """Merge conflicts report diagnostic and do not write output."""
+        base = self.write_json("base.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
+        ours = self.write_json("ours.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]})
+        theirs = self.write_json("theirs.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 2")]})
+        out_p = self.temp / "merged.json"
+
+        code, out, err = self.run_merge(str(base), str(ours), str(theirs), "--output", str(out_p))
+        self.assertEqual(code, 1)
+        self.assertIn("Merge Conflicts", err)
+        self.assertFalse(out_p.exists())
+
+    def test_cli_three_way_stale_destination_rejected(self):
+        """Concurrent modification to destination during merge is detected and rejected."""
+        base = self.write_json("base.json", {"monday": [make_slot("Math", "09:00", "10:00", "R101")]})
+        ours = self.write_json("ours.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]})
+        theirs = self.write_json("theirs.json", {"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]})
+        out_p = self.write_json("dest.json", {"friday": []})
+
+        # Mutate destination right during load
+        orig_load = load_timetable_for_merge
+        def mocked_load(path):
+            res = orig_load(path)
+            if "theirs.json" in str(path):
+                out_p.write_text(json.dumps({"monday": [make_slot("Stale", "10:00", "11:00", "X")]}), encoding="utf-8")
+            return res
+
+        import timetable.cli
+        from unittest.mock import patch
+        with patch.object(timetable.cli, "load_timetable_for_merge", side_effect=mocked_load):
+            code, out, err = self.run_merge(str(base), str(ours), str(theirs), "--output", str(out_p), "--force")
+            self.assertEqual(code, 1)
+            self.assertIn("was modified by another process concurrently", err)
+
+    def test_cli_three_way_input_files_remain_unchanged(self):
+        """Source files are never modified by three-way merge."""
+        b_text = json.dumps({"monday": [make_slot("Math", "09:00", "10:00", "R101")]}, indent=2)
+        o_text = json.dumps({"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]}, indent=2)
+        t_text = json.dumps({"monday": [make_slot("Math", "09:00", "10:00", "Lab 1")]}, indent=2)
+
+        base = self.write_json("base.json", b_text)
+        ours = self.write_json("ours.json", o_text)
+        theirs = self.write_json("theirs.json", t_text)
+        out_p = self.temp / "merged.json"
+
+        self.run_merge(str(base), str(ours), str(theirs), "--output", str(out_p))
+        self.assertEqual(base.read_text(encoding="utf-8"), b_text)
+        self.assertEqual(ours.read_text(encoding="utf-8"), o_text)
+        self.assertEqual(theirs.read_text(encoding="utf-8"), t_text)
 
 
 if __name__ == "__main__":

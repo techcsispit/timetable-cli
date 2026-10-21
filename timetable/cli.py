@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.schema import SchemaError
@@ -18,7 +18,7 @@ from timetable.free import find_free_slots, render_free_slots
 from timetable.now import current_now, render_now
 from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
-from timetable.conflicts import find_conflicts, render_conflicts
+from timetable.conflicts import do_overlap, find_clashing_slot, find_conflicts, render_conflicts
 from timetable.stats import compute_stats, render_stats
 from timetable.history import (
     DEFAULT_RETENTION_LIMIT,
@@ -42,8 +42,10 @@ from timetable.history import (
 from timetable.merge import (
     MergeError,
     load_timetable_for_merge,
+    merge_three_way,
     merge_timetables,
     render_merge_conflicts,
+    render_three_way_conflicts,
     validate_timetable_structure,
 )
 from timetable.import_csv import (
@@ -82,6 +84,14 @@ from timetable.undo import (
     redo_last,
     undo_last,
 )
+from timetable.locking import (
+    ConcurrencyError,
+    ConcurrentModificationError,
+    LockTimeoutError,
+    MultiFileLock,
+    TimetableFileLock,
+)
+from timetable.revision import REVISION_ABSENT, load_timetable_snapshot
 
 
 def validate_day(day_str):
@@ -127,16 +137,13 @@ def check_clash(slots, start_min, end_min):
     
     Returns the clashing slot dictionary, or None.
     """
+    candidate = {
+        "start": f"{start_min // 60:02d}:{start_min % 60:02d}",
+        "end": f"{end_min // 60:02d}:{end_min % 60:02d}",
+    }
     for slot in slots:
-        try:
-            sh, sm = map(int, slot["start"].split(":"))
-            eh, em = map(int, slot["end"].split(":"))
-            slot_start = sh * 60 + sm
-            slot_end = eh * 60 + em
-            if max(start_min, slot_start) < min(end_min, slot_end):
-                return slot
-        except Exception:
-            continue
+        if do_overlap(candidate, slot):
+            return slot
     return None
 
 
@@ -244,6 +251,8 @@ def _write_timetable_with_snapshot(
     filepath: Path,
     operation: str,
     previous: Dict[str, Any],
+    expected_revision: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> str:
     """Snapshot *previous*, then atomically write *data* to *filepath*.
 
@@ -253,11 +262,20 @@ def _write_timetable_with_snapshot(
     and the write is atomic so a failure never leaves a partially written
     timetable behind.  Returns the snapshot id.
     """
-    snapshot_id = _save_snapshot_before_file_write(
-        previous, filepath=filepath, operation=operation
-    )
-    _atomic_save_timetable(data, filepath)
-    return snapshot_id
+    with TimetableFileLock(filepath, timeout=lock_timeout):
+        if expected_revision is not None:
+            snap = load_timetable_snapshot(filepath, validate=False)
+            if snap.revision != expected_revision:
+                raise ConcurrentModificationError(
+                    filepath,
+                    expected_revision=expected_revision,
+                    current_revision=snap.revision,
+                )
+        snapshot_id = _save_snapshot_before_file_write(
+            previous, filepath=filepath, operation=operation
+        )
+        _atomic_save_timetable(data, filepath)
+        return snapshot_id
 
 
 def cmd_history(args):
@@ -319,10 +337,12 @@ def cmd_restore(args):
         return 1
 
     try:
+        active_snap = load_timetable_snapshot(args.file, validate=False)
         result = restore_snapshot(
             args.snapshot_id,
             filepath=Path(args.file),
             history_dir=history_dir,
+            expected_revision=active_snap.revision,
         )
     except (
         SnapshotNotFoundError,
@@ -401,12 +421,19 @@ def cmd_add(args):
         print(f"Error: Class ends before or at its start time ({args.start} to {args.end}).", file=sys.stderr)
         sys.exit(1)
 
-    data = load_timetable(args.file)
+    snapshot = load_timetable_snapshot(args.file)
+    data = snapshot.data
     previous_state = copy.deepcopy(data)
     if day not in data:
         data[day] = []
 
-    clashing_slot = check_clash(data[day], start_min, end_min)
+    candidate = {
+        "subject": args.subject,
+        "start": args.start,
+        "end": args.end,
+        "room": args.room,
+    }
+    clashing_slot = find_clashing_slot(data, day, candidate)
     if clashing_slot:
         clash_name = clashing_slot.get("subject", "Existing class")
         clash_time = f"{clashing_slot.get('start')} - {clashing_slot.get('end')}"
@@ -416,12 +443,7 @@ def cmd_add(args):
         )
         sys.exit(1)
 
-    data[day].append({
-        "subject": args.subject,
-        "start": args.start,
-        "end": args.end,
-        "room": args.room
-    })
+    data[day].append(candidate)
     data[day].sort(key=lambda s: s.get("start", ""))
 
     # Snapshot the timetable as it was *before* this addition (kept for the
@@ -435,7 +457,13 @@ def cmd_add(args):
         operation="add",
     )
     try:
-        commit_mutation(Path(args.file), "add", data)
+        commit_mutation(
+            Path(args.file),
+            "add",
+            data,
+            canonicalize=True,
+            expected_revision=snapshot.revision,
+        )
     except (HistoryFileError, NoOpError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -507,6 +535,7 @@ def cmd_import_csv(args):
     """Imports classes from a CSV file, with optional dry-run preview."""
     try:
         timetable_data = load_timetable_for_import(args.file)
+        snapshot = load_timetable_snapshot(args.file, validate=False)
         plan = plan_import(args.csv_file, timetable_data)
     except ImportError_ as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -527,7 +556,12 @@ def cmd_import_csv(args):
 
     updated = apply_import(timetable_data, plan)
     try:
-        commit_mutation(Path(args.file), "import-csv", updated)
+        commit_mutation(
+            Path(args.file),
+            "import-csv",
+            updated,
+            expected_revision=snapshot.revision,
+        )
     except (HistoryFileError, NoOpError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -570,6 +604,7 @@ def cmd_import_ics(args):
         sys.exit(1)
 
     try:
+        snapshot = load_timetable_snapshot(args.file)
         timetable_data = load_timetable_for_import(args.file)
         plan = plan_ics_import(
             args.ics_file,
@@ -607,6 +642,7 @@ def cmd_import_ics(args):
             filepath=target_file,
             operation="import-ics",
             previous=previous_state,
+            expected_revision=snapshot.revision,
         )
     except OSError as exc:
         print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
@@ -618,10 +654,45 @@ def cmd_import_ics(args):
 
 
 def cmd_merge(args):
-    """Merges two timetable JSON files with conflict detection."""
+    """Merges two or three timetable JSON files with conflict detection."""
+    # Determine base, ours, theirs or first, second
+    files = list(args.files) if hasattr(args, "files") and args.files else []
+    if not files:
+        if getattr(args, "first", None) and getattr(args, "second", None):
+            files = [args.first, args.second]
+
+    base_arg = getattr(args, "base", None)
+    is_three_way = False
+
+    if base_arg:
+        is_three_way = True
+        base_file = base_arg
+        if len(files) != 2:
+            print("Error: When --base is provided, exactly two modified timetable files ('ours' and 'theirs') must be specified.", file=sys.stderr)
+            sys.exit(1)
+        ours_file, theirs_file = files[0], files[1]
+    elif len(files) == 3:
+        is_three_way = True
+        base_file, ours_file, theirs_file = files[0], files[1], files[2]
+    elif len(files) == 2:
+        is_three_way = False
+        first_file, second_file = files[0], files[1]
+    else:
+        print("Error: 'merge' requires either two files (two-way merge) or three files (base, ours, theirs for three-way merge).", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        first_path = Path(args.first).resolve()
-        second_path = Path(args.second).resolve()
+        if is_three_way:
+            input_paths = {
+                "base": Path(base_file).resolve(),
+                "ours": Path(ours_file).resolve(),
+                "theirs": Path(theirs_file).resolve(),
+            }
+        else:
+            input_paths = {
+                "first": Path(first_file).resolve(),
+                "second": Path(second_file).resolve(),
+            }
     except Exception as exc:
         print(f"Error resolving paths: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -629,53 +700,117 @@ def cmd_merge(args):
     output_path = Path(args.output).resolve() if args.output else None
 
     if output_path:
-        if output_path == first_path or output_path == second_path:
-            print(
-                f"Error: Output file '{args.output}' cannot be the same as input file '{args.first if output_path == first_path else args.second}'.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        for role, p in input_paths.items():
+            if output_path == p:
+                print(
+                    f"Error: Output file '{args.output}' cannot be the same as input file '{p}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         if output_path.exists() and not args.force:
             print(
                 f"Error: Output file '{args.output}' already exists. Use --force to overwrite.",
                 file=sys.stderr,
             )
             sys.exit(1)
+    # If destination specified, capture its initial revision before loading sources
+    output_file = Path(output_path) if output_path else None
+    expected_dest_snap = load_timetable_snapshot(output_file, validate=False) if output_file else None
 
+    # Validate input files exist and are valid timetables, capturing source revisions
+    source_snapshots = {}
     try:
-        first_data = load_timetable_for_merge(args.first)
-        second_data = load_timetable_for_merge(args.second)
+        for role, p in input_paths.items():
+            # load_timetable_for_merge raises MergeError for missing files, invalid JSON, or schema errors
+            load_timetable_for_merge(p)
+            source_snapshots[p] = load_timetable_snapshot(p, validate=True)
     except MergeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-
-    merged_data, conflicts = merge_timetables(first_data, second_data)
-
-    if conflicts:
-        print(render_merge_conflicts(conflicts), file=sys.stderr)
-        print("Error: Could not merge timetables due to scheduling conflicts.", file=sys.stderr)
+    except (ValueError, SchemaError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Error reading input: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    if is_three_way:
+        base_data = source_snapshots[input_paths["base"]].data
+        ours_data = source_snapshots[input_paths["ours"]].data
+        theirs_data = source_snapshots[input_paths["theirs"]].data
+    else:
+        first_data = source_snapshots[input_paths["first"]].data
+        second_data = source_snapshots[input_paths["second"]].data
+
+    if is_three_way:
+        result = merge_three_way(base_data, ours_data, theirs_data)
+        if result.has_conflicts:
+            print(render_three_way_conflicts(result), file=sys.stderr)
+            print("Error: Could not merge timetables due to conflicts.", file=sys.stderr)
+            sys.exit(1)
+        merged_data = result.merged_data
+    else:
+        merged_data, conflicts = merge_timetables(first_data, second_data)
+        if conflicts:
+            print(render_merge_conflicts(conflicts), file=sys.stderr)
+            print("Error: Could not merge timetables due to scheduling conflicts.", file=sys.stderr)
+            sys.exit(1)
+
     if output_path:
-        output_file = Path(output_path)
-        # Keep the existing `history` snapshot when the output file already
-        # holds readable content (matches the previous behavior).
-        if output_file.exists():
-            try:
-                previous_state = load_timetable(output_file)
-            except (OSError, ValueError, SchemaError):
-                previous_state = None
-            if previous_state is not None:
-                _save_snapshot_before_file_write(
-                    previous_state,
-                    filepath=output_file,
-                    operation="merge",
-                )
+        # Collect all files to lock in deterministic order: all sources + destination
+        all_lock_paths = list(input_paths.values()) + [output_file]
+
         try:
-            commit_mutation(output_file, "merge", merged_data)
-        except (HistoryFileError, NoOpError) as exc:
+            with MultiFileLock(all_lock_paths):
+                # 1. Revalidate all source revisions under the lock
+                for p, initial_snap in source_snapshots.items():
+                    current_snap = load_timetable_snapshot(p, validate=False)
+                    if current_snap.revision != initial_snap.revision:
+                        raise ConcurrentModificationError(
+                            p,
+                            expected_revision=initial_snap.revision,
+                            current_revision=current_snap.revision,
+                        )
+
+                # 2. Revalidate destination revision under the lock
+                dest_current_snap = load_timetable_snapshot(output_file, validate=False)
+                if dest_current_snap.revision != expected_dest_snap.revision:
+                    raise ConcurrentModificationError(
+                        output_file,
+                        expected_revision=expected_dest_snap.revision,
+                        current_revision=dest_current_snap.revision,
+                    )
+
+                # 3. Snapshot destination for history if it exists
+                if output_file.exists():
+                    try:
+                        previous_state = load_timetable(output_file)
+                    except (OSError, ValueError, SchemaError):
+                        previous_state = None
+                    if previous_state is not None:
+                        _save_snapshot_before_file_write(
+                            previous_state,
+                            filepath=output_file,
+                            operation="merge",
+                        )
+
+                # 4. Commit mutation to destination
+                # Note: TimetableFileLock is reentrant across thread calls so commit_mutation
+                # will re-acquire destination lock safely.
+                try:
+                    commit_mutation(
+                        output_file,
+                        "merge",
+                        merged_data,
+                        expected_revision=expected_dest_snap.revision,
+                    )
+                except (HistoryFileError, NoOpError) as exc:
+                    # If NoOpError, save_timetable directly to ensure output file is present
+                    save_timetable(merged_data, output_file)
+        except ConcurrencyError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
+
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
@@ -980,10 +1115,17 @@ def main():
     # merge
     p_merge = subparsers.add_parser(
         "merge",
-        help="Merge two timetable JSON files with conflict detection",
+        help="Merge two or three timetable JSON files with conflict detection",
     )
-    p_merge.add_argument("first", help="Path to first timetable JSON file")
-    p_merge.add_argument("second", help="Path to second timetable JSON file")
+    p_merge.add_argument(
+        "files",
+        nargs="+",
+        help="Timetable files to merge. Specify two files (first second) or three files (base ours theirs).",
+    )
+    p_merge.add_argument(
+        "--base",
+        help="Path to common base timetable file (optional alternative for three-way merge: --base <base> <ours> <theirs>).",
+    )
     p_merge.add_argument("--output", help="Path to output merged timetable JSON file")
     p_merge.add_argument("--force", action="store_true", help="Overwrite output file if it already exists")
     p_merge.set_defaults(func=cmd_merge)
@@ -1133,6 +1275,12 @@ def main():
     try:
         result = args.func(args)
     except SchemaError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ConcurrentModificationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except LockTimeoutError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
