@@ -41,13 +41,13 @@ On Windows, use `python` instead of `python3`.
 | `free --duration N [--day --start --end]` | Free time slots at least N minutes long |
 | `add --day --subject --start --end --room` | Adds a class |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
+| `conflicts [file]` | Detects overlapping class schedules on the same day |
 | `merge <first> <second> [--output OUT] [--force]` | Combines two timetables into one with conflict detection |
 | `import-csv <file> [--dry-run]` | Imports classes from a CSV file with validation, duplicate detection and conflict checks |
-
 | `optimize [--config FILE] [--dry-run] [--apply]` | Optimizes schedule to reduce daily gaps, span, and balance workload |
-
 | `import-ics <file> [--from --to --timezone --dry-run]` | Imports classes from an iCalendar (.ics) file with recurrence expansion, duplicate detection and conflict checks |
-
+| `history [list\|show\|restore]` | Inspects timetable snapshots and restores previous states |
+| `restore <snapshot-id>` | Restores the active timetable directly from a snapshot |
 | `undo` | Undoes the most recent timetable change |
 | `redo` | Redoes the most recently undone timetable change |
 | `undo-history` | Lists recorded undo entries for the timetable |
@@ -499,6 +499,7 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - `timetable/filter.py`: reusable filtering by day, time range and room
 - `timetable/free.py`: calculating and rendering free time slots of a given duration
 - `timetable/diff.py`: comparing two timetable files
+- `timetable/conflicts.py`: detecting overlapping class schedules on the same day
 - `timetable/merge.py`: combining timetables with deduplication and conflict detection
 - `timetable/import_csv.py`: parsing, validating, planning and safely writing CSV imports
 
