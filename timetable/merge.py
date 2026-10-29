@@ -6,6 +6,8 @@ from timetable.display import WEEKDAYS, parse_time
 from timetable.conflicts import do_overlap, find_conflicts
 from timetable.loader import load_timetable
 from timetable.schema import SchemaError
+from timetable.diagnostics import Diagnostic, RuleId, Severity, Provenance, AffectedEntry
+from timetable.engine import validate_temporal_conflicts
 
 
 class MergeError(Exception):
@@ -196,6 +198,36 @@ class MergeConflict:
     def __repr__(self):
         return f"<MergeConflict {self.conflict_type} on {self.day}: {self.message}>"
 
+    def to_diagnostic(self) -> Diagnostic:
+        """Converts this MergeConflict into a structured Diagnostic."""
+        affected = []
+        if self.base_entry:
+            affected.append(AffectedEntry(
+                day=self.day,
+                slot=self.base_entry,
+                provenance=Provenance(source_type="merge", merge_side="base")
+            ))
+        if self.ours_entry:
+            affected.append(AffectedEntry(
+                day=self.day,
+                slot=self.ours_entry,
+                provenance=Provenance(source_type="merge", merge_side="ours")
+            ))
+        if self.theirs_entry:
+            affected.append(AffectedEntry(
+                day=self.day,
+                slot=self.theirs_entry,
+                provenance=Provenance(source_type="merge", merge_side="theirs")
+            ))
+        return Diagnostic(
+            rule_id=RuleId.MERGE_STRUCTURAL_CONFLICT,
+            severity=Severity.ERROR,
+            message=self.message or f"Structural merge conflict ({self.conflict_type}) on {self.day.capitalize()}",
+            affected_entries=affected,
+            source=Provenance(source_type="merge"),
+            context={"conflict_type": self.conflict_type, "day": self.day}
+        )
+
     def sort_key(self):
         day_idx = WEEKDAYS.index(self.day.lower()) if self.day.lower() in WEEKDAYS else len(WEEKDAYS)
         start = ""
@@ -211,16 +243,40 @@ class MergeConflict:
 class ThreeWayMergeResult:
     """Holds the result of a three-way timetable merge."""
 
-    def __init__(self, merged_data, merge_conflicts=None, schedule_conflicts=None, validation_errors=None):
+    def __init__(self, merged_data, merge_conflicts=None, schedule_conflicts=None, validation_errors=None, diagnostics=None):
         self.merged_data = merged_data
         self.merge_conflicts = sorted(merge_conflicts or [], key=lambda c: c.sort_key())
         self.schedule_conflicts = schedule_conflicts or []
         self.validation_errors = validation_errors or []
+        if diagnostics is not None:
+            self.diagnostics = sorted(diagnostics, key=lambda d: d.sort_key())
+        else:
+            diags = [c.to_diagnostic() for c in self.merge_conflicts]
+            for day, a, b in self.schedule_conflicts:
+                diags.append(Diagnostic(
+                    rule_id=RuleId.MERGE_SCHEDULE_CONFLICT,
+                    severity=Severity.ERROR,
+                    message=f"Schedule conflict in merged timetable on {day.capitalize()}: '{a.get('subject')}' ({a.get('start')}-{a.get('end')}) overlaps with '{b.get('subject')}' ({b.get('start')}-{b.get('end')})",
+                    affected_entries=[
+                        AffectedEntry(day=day, slot=a, provenance=Provenance(source_type="merge")),
+                        AffectedEntry(day=day, slot=b, provenance=Provenance(source_type="merge")),
+                    ],
+                    source=Provenance(source_type="merge"),
+                    context={"day": day, "slot_a": a, "slot_b": b}
+                ))
+            for err in self.validation_errors:
+                diags.append(Diagnostic(
+                    rule_id=RuleId.ENTRY_DUPLICATE if "Duplicate" in err else RuleId.ENTRY_MALFORMED,
+                    severity=Severity.ERROR,
+                    message=err,
+                    source=Provenance(source_type="merge")
+                ))
+            self.diagnostics = sorted(diags, key=lambda d: d.sort_key())
 
     @property
     def has_conflicts(self):
         """True if there are merge conflicts, schedule conflicts, or validation errors."""
-        return bool(self.merge_conflicts or self.schedule_conflicts or self.validation_errors)
+        return bool(self.merge_conflicts or self.schedule_conflicts or self.validation_errors or any(d.is_error for d in self.diagnostics))
 
     @property
     def is_clean(self):

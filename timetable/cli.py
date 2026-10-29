@@ -20,6 +20,8 @@ from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 from timetable.conflicts import do_overlap, find_clashing_slot, find_conflicts, render_conflicts
 from timetable.stats import compute_stats, render_stats
+from timetable.engine import validate_timetable
+from timetable.diagnostics import render_diagnostics
 from timetable.history import (
     DEFAULT_RETENTION_LIMIT,
     ENV_HISTORY_LIMIT,
@@ -449,6 +451,16 @@ def cmd_add(args):
         )
         sys.exit(1)
 
+    # Validate mutated candidate against unified validation engine
+    candidate_timetable = copy.deepcopy(data)
+    candidate_timetable[day] = copy.deepcopy(data[day])
+    candidate_timetable[day].append(candidate)
+    report = validate_timetable(candidate_timetable, source_path=args.file)
+    if not report.is_valid:
+        error_msgs = [d.message for d in report.errors]
+        print(f"Error: {error_msgs[0]}", file=sys.stderr)
+        sys.exit(1)
+
     data[day].append(candidate)
     data[day].sort(key=lambda s: s.get("start", ""))
 
@@ -508,6 +520,11 @@ def cmd_conflicts(args):
     except Exception as exc:
         print(f"Error reading {filepath}: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if getattr(args, "json", False):
+        report = validate_timetable(data, source_path=str(target))
+        print(json.dumps(report.to_dict(), indent=2))
+        sys.exit(1 if report.errors else 0)
 
     conflicts = find_conflicts(data)
     render_conflicts(conflicts)
@@ -1062,6 +1079,11 @@ def main():
         nargs="?",
         default=None,
         help="Path to timetable JSON file (defaults to timetable.json)",
+    )
+    p_conflicts.add_argument(
+        "--json",
+        action="store_true",
+        help="Output diagnostics in structured JSON format",
     )
     p_conflicts.set_defaults(func=cmd_conflicts)
 

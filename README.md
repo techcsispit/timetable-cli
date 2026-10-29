@@ -519,8 +519,8 @@ Both flat root weekdays and nested `{"schema_version": 1, "timetable": { ... }}`
 - `timetable/optimizer_config.py`: optimization configuration and constraint representations
 - `timetable/optimizer_scoring.py`: multi-objective metrics and scoring engine
 - `timetable/optimizer_engine.py`: bounded hill-climbing search and change explanations
-
-
+- `timetable/diagnostics.py`: structured validation diagnostics, rule catalog, and source provenance
+- `timetable/engine.py`: unified validation engine and conflict explanations
 - `timetable/import_ics.py`: parsing, recurrence expansion, validating, planning and importing iCalendar (.ics) files
 
 - `timetable/history.py`: snapshot management and manual restore browser
@@ -577,6 +577,90 @@ When Hypothesis finds a counterexample, it prints the minimal shrinking repro wi
    ```bash
    pytest tests/test_temporal_properties.py --hypothesis-seed=<seed>
    ```
+
+## Unified Validation Engine
+
+`timetable-cli` incorporates a unified validation engine (`timetable/engine.py` and `timetable/diagnostics.py`) providing deterministic, structured diagnostics across the application: schema validation, timetable mutations (`add`), CSV and iCalendar imports, and three-way merges.
+
+### Diagnostic Data Model
+
+Every validation issue is surfaced as a structured `Diagnostic` object:
+- `rule_id`: Stable machine-readable identifier (e.g., `RuleId.SCHEDULE_CONFLICT`, `RuleId.SCHEMA_INVALID`, `RuleId.WEEKDAY_INVALID`).
+- `severity`: Standard severity level: `error`, `warning`, or `info`.
+- `message`: Human-readable explanation of what failed and why.
+- `affected_entries`: List of `AffectedEntry` objects identifying the specific day and slot(s) involved in the issue.
+- `source`: Optional `Provenance` record tracing origin (file path, CSV row, ICS line/UID, merge side `base`/`ours`/`theirs`).
+- `context`: Structured key-value metadata providing details (e.g. interval minutes, collision day, conflicting fields).
+
+### Rule Catalog
+
+| Rule Identifier | Severity | Description |
+|---|---|---|
+| `SCHEMA_INVALID` | error | Malformed document root, invalid slot types, or unrecognized keys |
+| `VERSION_UNSUPPORTED` | error | Timetable schema version not supported |
+| `WEEKDAY_INVALID` | error | Unrecognized weekday key or casing issue |
+| `ENTRY_MALFORMED` | error | Slot missing required fields (`subject`, `start`, `end`, `room`) or wrong data types |
+| `TIME_INVALID` | error | Invalid time string format (must be 24-hour `HH:MM`) |
+| `INTERVAL_INVALID` | error | Class ends at or before start time within the same day |
+| `ENTRY_DUPLICATE` | warning | Identical class slot repeated on the same day |
+| `SCHEDULE_CONFLICT` | error | Overlapping classes within the same weekday |
+| `SCHEDULE_CONFLICT_OVERNIGHT` | error | Overlap involving an overnight class crossing midnight into another day |
+| `IMPORT_HEADER_INVALID` | error | CSV file missing mandatory column headers |
+| `IMPORT_RECORD_MALFORMED` | error | CSV record with wrong number of fields or empty required values |
+| `RECURRENCE_INVALID` | error | Malformed recurrence rule or invalid RRULE parameters |
+| `RECURRENCE_UNSUPPORTED` | warning | Unsupported recurrence frequency or parameter |
+| `MERGE_STRUCTURAL_CONFLICT` | error | Incompatible branch modifications during three-way merge |
+| `MERGE_SCHEDULE_CONFLICT` | error | Overlapping schedule classes in merged timetable result |
+
+### CLI Structured Diagnostics
+
+The `conflicts` command supports structured diagnostic output via `--json`:
+```bash
+python -m timetable conflicts --json
+```
+
+Output:
+```json
+{
+  "is_valid": false,
+  "errors": [
+    {
+      "rule_id": "SCHEDULE_CONFLICT",
+      "severity": "error",
+      "message": "Schedule conflict on Monday between 'Math' (09:00-10:30) and 'Physics' (10:00-11:00)",
+      "affected_entries": [
+        {
+          "day": "monday",
+          "slot": {
+            "subject": "Math",
+            "start": "09:00",
+            "end": "10:30",
+            "room": "101"
+          }
+        },
+        {
+          "day": "monday",
+          "slot": {
+            "subject": "Physics",
+            "start": "10:00",
+            "end": "11:00",
+            "room": "102"
+          }
+        }
+      ],
+      "context": {
+        "collision_day": "monday",
+        "day_a": "monday",
+        "day_b": "monday",
+        "interval_a": [540, 630],
+        "interval_b": [600, 660],
+        "is_overnight": false
+      }
+    }
+  ],
+  "warnings": []
+}
+```
 
 ## Contributing
 

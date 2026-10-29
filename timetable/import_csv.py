@@ -17,9 +17,22 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional, List
 
 from timetable.conflicts import weekly_slots_overlap
+from timetable.diagnostics import (
+    AffectedEntry,
+    Diagnostic,
+    Provenance,
+    RuleId,
+    Severity,
+    ValidationReport,
+)
 from timetable.display import WEEKDAYS, parse_time
+from timetable.engine import (
+    validate_csv_headers,
+    validate_csv_row,
+)
 from timetable.loader import load_timetable
 from timetable.schema import SchemaError
 
@@ -36,6 +49,21 @@ class ValidationIssue:
 
     row: int
     message: str
+    rule_id: Optional[str] = None
+    source_path: Optional[str] = None
+
+    def to_diagnostic(self) -> Diagnostic:
+        """Converts this issue to a structured Diagnostic."""
+        return Diagnostic(
+            rule_id=self.rule_id or RuleId.IMPORT_RECORD_MALFORMED.value,
+            severity=Severity.ERROR.value,
+            message=self.message,
+            source=Provenance(
+                source_type="csv",
+                source_path=self.source_path,
+                row=self.row,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -65,6 +93,7 @@ class ImportPlan:
     duplicates: list = field(default_factory=list)
     invalid_records: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
+    diagnostics: List[Diagnostic] = field(default_factory=list)
 
     @property
     def accepted(self):
@@ -276,9 +305,11 @@ def plan_import(csv_path, timetable_data):
     if not rows:
         return plan
 
-    header_error = _normalize_headers(rows[0])
-    if header_error:
-        plan.invalid_records.append(ValidationIssue(1, header_error))
+    src_str = str(csv_path)
+    header_diag = validate_csv_headers(rows[0], source_path=src_str)
+    if header_diag:
+        plan.invalid_records.append(ValidationIssue(1, header_diag.message, rule_id=header_diag.rule_id, source_path=src_str))
+        plan.diagnostics.append(header_diag)
         return plan
 
     records = rows[1:]
@@ -290,12 +321,21 @@ def plan_import(csv_path, timetable_data):
     for offset, values in enumerate(records):
         row = offset + 2
         if not values or not any(str(value).strip() for value in values):
-            plan.invalid_records.append(ValidationIssue(row, "record is empty"))
+            diag = Diagnostic(
+                rule_id=RuleId.IMPORT_RECORD_MALFORMED.value,
+                severity=Severity.ERROR.value,
+                message="record is empty",
+                source=Provenance(source_type="csv", source_path=src_str, row=row),
+            )
+            plan.invalid_records.append(ValidationIssue(row, "record is empty", rule_id=RuleId.IMPORT_RECORD_MALFORMED.value, source_path=src_str))
+            plan.diagnostics.append(diag)
             continue
 
-        record, issues = _validate_record(values, row)
-        if issues:
-            plan.invalid_records.extend(issues)
+        record, diags = validate_csv_row(values, row, source_path=src_str)
+        if diags:
+            for d in diags:
+                plan.invalid_records.append(ValidationIssue(row, d.message, rule_id=d.rule_id, source_path=src_str))
+                plan.diagnostics.append(d)
             continue
         valid_records.append((row, record["day"], record["slot"]))
 
@@ -324,15 +364,32 @@ def plan_import(csv_path, timetable_data):
             unique_new.append((row, day, slot))
     plan.new_classes = unique_new
 
-    for index, (_, day, first) in enumerate(plan.new_classes):
-        for _, second_day, second in plan.new_classes[index + 1:]:
+    for index, (first_row, day, first) in enumerate(plan.new_classes):
+        entry_a = AffectedEntry(day=day, slot=first, provenance=Provenance(source_type="csv", source_path=src_str, row=first_row))
+        for second_row, second_day, second in plan.new_classes[index + 1:]:
             if weekly_slots_overlap(day, first, second_day, second):
                 plan.conflicts.append(ConflictPair(day, first, second))
+                entry_b = AffectedEntry(day=second_day, slot=second, provenance=Provenance(source_type="csv", source_path=src_str, row=second_row))
+                plan.diagnostics.append(Diagnostic(
+                    rule_id=RuleId.SCHEDULE_CONFLICT_OVERNIGHT.value if day != second_day else RuleId.SCHEDULE_CONFLICT.value,
+                    severity=Severity.ERROR.value,
+                    message=f"Schedule conflict on {day.capitalize()} between '{first.get('subject')}' and '{second.get('subject')}'",
+                    affected_entries=[entry_a, entry_b],
+                    source=Provenance(source_type="csv", source_path=src_str, row=first_row),
+                ))
 
         for existing_day in WEEKDAYS:
             for existing in _existing_slots(timetable_data, existing_day):
                 if weekly_slots_overlap(day, first, existing_day, existing):
                     plan.conflicts.append(ConflictPair(day, first, existing))
+                    entry_exist = AffectedEntry(day=existing_day, slot=existing, provenance=Provenance(source_type="timetable"))
+                    plan.diagnostics.append(Diagnostic(
+                        rule_id=RuleId.SCHEDULE_CONFLICT_OVERNIGHT.value if day != existing_day else RuleId.SCHEDULE_CONFLICT.value,
+                        severity=Severity.ERROR.value,
+                        message=f"Schedule conflict on {day.capitalize()} between import class '{first.get('subject')}' and existing class '{existing.get('subject')}'",
+                        affected_entries=[entry_a, entry_exist],
+                        source=Provenance(source_type="csv", source_path=src_str, row=first_row),
+                    ))
 
     return plan
 

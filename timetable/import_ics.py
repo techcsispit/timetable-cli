@@ -21,6 +21,14 @@ import dateutil.rrule
 
 from timetable.conflicts import do_overlap
 from timetable.display import WEEKDAYS, parse_time
+from timetable.diagnostics import (
+    AffectedEntry,
+    Diagnostic,
+    Provenance,
+    RuleId,
+    Severity,
+    ValidationReport,
+)
 from timetable.import_csv import (
     ConflictPair,
     DuplicateEntry,
@@ -63,6 +71,7 @@ class IcsImportPlan:
     duplicates: List[DuplicateEntry] = field(default_factory=list)
     invalid_records: List[ValidationIssue] = field(default_factory=list)
     conflicts: List[ConflictPair] = field(default_factory=list)
+    diagnostics: List[Diagnostic] = field(default_factory=list)
 
     @property
     def accepted(self) -> bool:
@@ -1052,18 +1061,50 @@ def plan_ics_import(
     # Conflict detection:
     # 1. Check between proposed new classes
     # 2. Check between new classes and existing timetable slots
+    src_str = str(file_path)
+    for issue in plan.invalid_records:
+        plan.diagnostics.append(
+            Diagnostic(
+                rule_id=issue.rule_id or RuleId.IMPORT_RECORD_MALFORMED.value,
+                severity=Severity.ERROR.value,
+                message=issue.message,
+                source=Provenance(source_type="ics", source_path=src_str, line=issue.row),
+            )
+        )
+
     for day in WEEKDAYS:
-        new_day = [slot for _, entry_day, slot in plan.new_classes if entry_day == day]
+        new_day_tuples = [(line_no, slot) for line_no, entry_day, slot in plan.new_classes if entry_day == day]
         existing_day = _existing_slots(timetable_data, day)
 
-        for index, first in enumerate(new_day):
-            for second in new_day[index + 1:]:
+        for index, (first_line, first) in enumerate(new_day_tuples):
+            entry_a = AffectedEntry(day=day, slot=first, provenance=Provenance(source_type="ics", source_path=src_str, line=first_line))
+            for second_line, second in new_day_tuples[index + 1:]:
                 if do_overlap(first, second):
                     plan.conflicts.append(ConflictPair(day, first, second))
+                    entry_b = AffectedEntry(day=day, slot=second, provenance=Provenance(source_type="ics", source_path=src_str, line=second_line))
+                    plan.diagnostics.append(
+                        Diagnostic(
+                            rule_id=RuleId.SCHEDULE_CONFLICT.value,
+                            severity=Severity.ERROR.value,
+                            message=f"Schedule conflict on {day.capitalize()} between '{first.get('subject')}' and '{second.get('subject')}'",
+                            affected_entries=[entry_a, entry_b],
+                            source=Provenance(source_type="ics", source_path=src_str, line=first_line),
+                        )
+                    )
 
             for existing in existing_day:
                 if do_overlap(first, existing):
                     plan.conflicts.append(ConflictPair(day, first, existing))
+                    entry_exist = AffectedEntry(day=day, slot=existing, provenance=Provenance(source_type="timetable"))
+                    plan.diagnostics.append(
+                        Diagnostic(
+                            rule_id=RuleId.SCHEDULE_CONFLICT.value,
+                            severity=Severity.ERROR.value,
+                            message=f"Schedule conflict on {day.capitalize()} between imported event '{first.get('subject')}' and existing class '{existing.get('subject')}'",
+                            affected_entries=[entry_a, entry_exist],
+                            source=Provenance(source_type="ics", source_path=src_str, line=first_line),
+                        )
+                    )
 
     return plan
 
